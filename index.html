@@ -158,7 +158,7 @@ SELECT TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON
 FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
   AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' AND PRODUCT IN (${slugs})
   AND (TEAM_ID IS NULL OR TEAM_ID NOT IN (SELECT mid FROM report_mids)) GROUP BY 1,2 ORDER BY 1,2`; };
-const qNoMatchDeals = (types, limit=150) => { const slugs=types.map(t=>sq(t.slug)).join(",");
+const qNoMatchDeals = (types, limit=100) => { const slugs=types.map(t=>sq(t.slug)).join(",");
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
 SELECT DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, COALESCE(TEAM_ID,'—') AS redo_id,
   PRODUCT AS type, ROUND(DEAL_AMOUNT) AS arr,
@@ -250,8 +250,31 @@ async function refreshAll(config, nowKey){
 const STORE = { config:"attainment_config", data:"attainment_data" };
 async function saveConfig(c){ await fridge.db.collection(STORE.config).create({value:c},"v1"); }
 async function loadConfig(){ try{ const d=await fridge.db.collection(STORE.config).list(); const doc=d.find(x=>x.key==="v1")||d[0]; return doc?(doc.value?.value||doc.value):null; }catch{return null;} }
-async function saveData(x){ await fridge.db.collection(STORE.data).create({value:x},"latest"); }
-async function loadData(){ try{ const d=await fridge.db.collection(STORE.data).list(); const doc=d.find(x=>x.key==="latest")||d[0]; return doc?(doc.value?.value||doc.value):null; }catch{return null;} }
+/* The cohort grid is far larger than fridge.db's 64 KB/doc limit, so the cache
+   is chunked: a "latest" manifest doc plus grid_N docs of ~30 rows each. */
+async function saveData(x){
+  const col = fridge.db.collection(STORE.data);
+  const CHUNK = 25;
+  const chunks = [];
+  for(let i=0;i<x.grid.length;i+=CHUNK) chunks.push(x.grid.slice(i,i+CHUNK));
+  for(let i=0;i<chunks.length;i++) await col.create({value:chunks[i]}, "grid_"+i);
+  await col.create({value:{ v:2, chunks:chunks.length, totalMapped:x.totalMapped,
+    noMatchAgg:x.noMatchAgg, noMatchDeals:x.noMatchDeals, nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
+}
+async function loadData(){
+  try{
+    const docs = await fridge.db.collection(STORE.data).list();
+    const map = {}; for(const d of docs) map[d.key] = (d.value && d.value.value!==undefined) ? d.value.value : d.value;
+    const man = map["latest"]; if(!man) return null;
+    if(man.v===2){
+      const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
+      if(grid.length!==0 || man.chunks===0)
+        return { grid, totalMapped:man.totalMapped, noMatchAgg:man.noMatchAgg, noMatchDeals:man.noMatchDeals, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
+      return null;
+    }
+    return man.grid ? man : null;
+  }catch{ return null; }
+}
 
 /* ---------------- model ---------------- */
 function computeModel(data, selected){
@@ -347,18 +370,19 @@ async function doRefresh(cfgOverride){
   try{
     const disc = await discover();
     const merged = mergeDiscovery(cfg, disc);
-    await saveConfig(merged);
+    try{ await saveConfig(merged); }catch(e){ console.warn("config cache failed", e); }
     setState({ discovered:disc, config:merged, busyMsg:"Querying Snowflake — cohort grid, revenue totals, no-match…" });
     const fresh = await refreshAll(merged, nowMonthKey());
-    await saveData(fresh);
     const selected = state.selected.size ? state.selected : defaultSelection(merged);
     setState({ data:fresh, selected, phase:"ready", busyMsg:"" });
+    // cache is best-effort: a failed write must never break a completed refresh
+    try{ await saveData(fresh); }catch(e){ console.warn("data cache failed", e); }
   }catch(e){
     setState({ error:String(e?.message||e), phase: state.data?"ready":"error", busyMsg:"" });
   }
 }
 async function saveConfigAndRefresh(newCfg){
-  await saveConfig(newCfg);
+  try{ await saveConfig(newCfg); }catch(e){ console.warn("config cache failed", e); }
   setState({ config:newCfg, selected:defaultSelection(newCfg), drawer:false });
   await doRefresh(newCfg);
 }

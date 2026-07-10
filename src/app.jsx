@@ -89,14 +89,15 @@ export default function App() {
       setDiscovered(disc);
       const merged = mergeDiscovery(cfg, disc);
       setConfig(merged);
-      await saveConfig(fridge, merged);
+      try { await saveConfig(fridge, merged); } catch (e) { console.warn("config cache failed", e); }
 
       setBusyMsg("Querying Snowflake — cohort grid, revenue totals, no-match…");
       const fresh = await refreshAll(fridge, merged, nowMonthKey());
       setData(fresh);
-      await saveData(fridge, fresh);
       setSelected((prev) => (prev.size ? prev : defaultSelection(merged)));
       setPhase("ready");
+      // cache is best-effort: a failed write must never break a completed refresh
+      try { await saveData(fridge, fresh); } catch (e) { console.warn("data cache failed", e); }
     } catch (e) {
       setError(String(e?.message || e));
       setPhase(data ? "ready" : "error");
@@ -105,7 +106,7 @@ export default function App() {
 
   const saveConfigAndRefresh = useCallback(async (newCfg) => {
     setConfig(newCfg);
-    if (fridge) await saveConfig(fridge, newCfg);
+    if (fridge) { try { await saveConfig(fridge, newCfg); } catch (e) { console.warn("config cache failed", e); } }
     setSelected(defaultSelection(newCfg));
     setDrawer(false);
     await doRefresh(newCfg);

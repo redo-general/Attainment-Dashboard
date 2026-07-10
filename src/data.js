@@ -140,14 +140,35 @@ export async function loadConfig(fridge) {
     return doc ? (doc.value?.value || doc.value) : null;
   } catch { return null; }
 }
+/* The cohort grid dwarfs fridge.db's 64 KB/doc limit, so the cache is chunked:
+   a "latest" manifest doc plus grid_N docs of ~25 rows each. */
 export async function saveData(fridge, data) {
-  await fridge.db.collection(STORE.data).create({ value: data }, "latest");
+  const col = fridge.db.collection(STORE.data);
+  const CHUNK = 25;
+  const chunks = [];
+  for (let i = 0; i < data.grid.length; i += CHUNK) chunks.push(data.grid.slice(i, i + CHUNK));
+  for (let i = 0; i < chunks.length; i++) await col.create({ value: chunks[i] }, "grid_" + i);
+  await col.create({ value: {
+    v: 2, chunks: chunks.length, totalMapped: data.totalMapped,
+    noMatchAgg: data.noMatchAgg, noMatchDeals: data.noMatchDeals,
+    nowKey: data.nowKey, refreshedAt: data.refreshedAt,
+  } }, "latest");
 }
 export async function loadData(fridge) {
   try {
     const docs = await fridge.db.collection(STORE.data).list();
-    const doc = docs.find((d) => d.key === "latest") || docs[0];
-    return doc ? (doc.value?.value || doc.value) : null;
+    const map = {};
+    for (const d of docs) map[d.key] = (d.value && d.value.value !== undefined) ? d.value.value : d.value;
+    const man = map["latest"];
+    if (!man) return null;
+    if (man.v === 2) {
+      const grid = [];
+      for (let i = 0; i < man.chunks; i++) { const c = map["grid_" + i]; if (Array.isArray(c)) grid.push(...c); }
+      if (grid.length !== 0 || man.chunks === 0)
+        return { grid, totalMapped: man.totalMapped, noMatchAgg: man.noMatchAgg, noMatchDeals: man.noMatchDeals, nowKey: man.nowKey, refreshedAt: man.refreshedAt };
+      return null;
+    }
+    return man.grid ? man : null;
   } catch { return null; }
 }
 

@@ -149,7 +149,7 @@ GROUP BY 1,2 ORDER BY 1,2`;
 }
 
 /* ---- 6. No-match deals list: largest unmatched deals for the modal ---- */
-export function qNoMatchDeals(types, limit = 150) {
+export function qNoMatchDeals(types, limit = 100) {
   const slugs = types.map((t) => sq(t.slug)).join(",");
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
 SELECT DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, COALESCE(TEAM_ID,'—') AS redo_id,
