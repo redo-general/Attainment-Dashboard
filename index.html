@@ -361,9 +361,17 @@ const REPORT_CLOUDS = [
   { id:"finance", col:"Finance Cloud Revenue", label:"Finance" },
   { id:"plat", col:"Platform Cloud Revenue", label:"Platform" },
 ];
+/* Known parent/child revenue columns: the child's dollars already sit inside the
+   parent, so a deal type can map both on purpose (a Returns deal includes its
+   international-returns revenue; an International Returns deal shows only that) —
+   but the product-vs-cloud reconciliation check must not count the child twice,
+   so it is excluded from the cloud-sum whenever its parent is also mapped. */
+const CHILD_COLS = { "International Returns Revenue": "Returns Revenue" };
 function qReconcile(config, excluded=[]){
+  const allCols = new Set(mappedTypes(config).flatMap(t=>t.cols));
   const byCloud={};
-  for(const t of mappedTypes(config)){ const cl=typeCloud(config,t.slug); (byCloud[cl]=byCloud[cl]||[]).push(...t.cols); }
+  for(const t of mappedTypes(config)){ const cl=typeCloud(config,t.slug);
+    for(const c of t.cols){ if(CHILD_COLS[c] && allCols.has(CHILD_COLS[c])) continue; (byCloud[cl]=byCloud[cl]||[]).push(c); } }
   const prodSum = cols => (cols&&cols.length) ? cols.map(c=>`ZEROIFNULL(${qid(c)})`).join(" + ") : "0";
   const cSel = REPORT_CLOUDS.map(rc=>`ROUND(SUM(ZEROIFNULL(${qid(rc.col)}))) AS c_${rc.id}`).join(", ");
   const pSel = REPORT_CLOUDS.filter(rc=>rc.id!=="finance").map(rc=>`ROUND(SUM(${prodSum(byCloud[rc.id])})) AS p_${rc.id}`).join(", ");
@@ -408,17 +416,18 @@ function mergeDiscovery(config, disc){
    Revenue" onto the helpdesk type (Platform cloud = Helpdesk + Support AI + AEO
    + Reclaim exactly). Returns true when it actually changed a mapping (so the
    caller can re-query the now-stale cached grid). */
-const CONFIG_MIG = 1;
+const CONFIG_MIG = 2;
 function migrateConfig(cfg){
-  let changed=false;
-  if((cfg.mig||0) < 1){
+  const from = cfg.mig || 0;
+  if(from < 1){
     const h = cfg.types && cfg.types.helpdesk;
-    if(h && Array.isArray(h.cols) && !h.cols.includes("Support AI Revenue")){
-      h.cols.push("Support AI Revenue"); changed=true;
-    }
+    if(h && Array.isArray(h.cols) && !h.cols.includes("Support AI Revenue")) h.cols.push("Support AI Revenue");
   }
+  // mig 2 changes no mapping, but the reconciliation query changed (International
+  // Returns is now treated as a child of Returns), so the cached recon is stale.
+  // Any version advance returns true, so boot re-queries once to refresh it.
   cfg.mig = CONFIG_MIG;
-  return changed;
+  return from < CONFIG_MIG;
 }
 /* Mapped types = enabled types with a revenue column (drive attributed revenue). */
 const mappedTypes = config => config.order.filter(s=>config.types[s].on && config.types[s].cols && config.types[s].cols.length).map(s=>({slug:s,cols:config.types[s].cols}));
@@ -1027,7 +1036,7 @@ function ChecksModal(){
         h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"3px",lineHeight:"18px",fontVariantNumeric:"tabular-nums"}}, c.detail))));
   });
   body.appendChild(h("p",{style:{padding:"16px 24px",fontSize:"11px",color:T.muted,lineHeight:"17px",margin:0}},
-    "“Products track the cloud total” compares the sum of the deal-type→column mappings in Configure against the report's cloud rollup column. An over means the product columns share revenue (double-count — why All products uses Total Revenue instead); an under means the cloud earns revenue from columns not mapped to any deal type."));
+    "“Products track the cloud total” compares the sum of the deal-type→column mappings in Configure against the report's cloud rollup column. An over means the product columns share revenue (double-count — why All products uses Total Revenue instead); an under means the cloud earns revenue from columns not mapped to any deal type. Known parent/child columns (International Returns sits inside Returns) are intentionally mapped to both types but counted once here."));
   return ModalShell("Data integrity · live", "Reconciliation checks", subtitle, body, close);
 }
 function MerchantPanel(){
