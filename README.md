@@ -14,7 +14,7 @@ Everything runs as read-only SQL through the **Fridge Snowflake runtime API**
 
 | Source | Role |
 | --- | --- |
-| `STAGING.HUBSPOT.STG_DEALS` | Closed-won deals: `PRODUCT` (deal type), `DEAL_AMOUNT` (annualized ARR), `CLOSED_WON`, `TEAM_ID` (Redo ID) |
+| `STAGING.HUBSPOT.STG_DEALS` | Closed-won deals in the **New Business (`default`) + XSell (`702972541`)** pipelines: `PRODUCT` (deal type), `DEAL_AMOUNT` (annualized ARR), `CLOSED_WON`, `TEAM_ID` (Redo ID) |
 | `KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2` | One row per merchant per platform per month; per-product revenue columns |
 
 **Join key:** `STG_DEALS.TEAM_ID` = `INGR_MONTHLY_REPORT_V2."Merchant ID"` (Redo /
@@ -31,8 +31,14 @@ Merchant / Team ID).
   denominator from that month on, so re-signed merchants never double-count.
 - **Attainment** = Σ attributed revenue ÷ Σ expected, recomputed live for
   whatever deal types are in view.
-- **No match** row — closed-won deals whose Redo ID is null or absent from the
-  Monthly Report (unmeasurable, kept out of cohort attainment but surfaced).
+- **Bookings scope** — only the **New Business + XSell** pipelines count as
+  closed-won bookings (Upsell, Churn, Acquisitions, etc. are excluded), matching
+  HubSpot's closed-won figures.
+- **No match / unmapped** row — a complete reconciliation bucket: every NB+XSell
+  closed-won deal *not* in the matched grid (unmatched Redo ID, or a product type
+  with no mapped revenue column). Grid ARR + this bucket ties out to HubSpot
+  closed-won per cohort (e.g. Jun '26 = $10.06M grid + $1.97M unmeasured =
+  $12.03M).
 - **Unattributed revenue** row — mapped-column revenue from merchants with no
   included deal of that type, so the table reconciles to Monthly Report totals.
 

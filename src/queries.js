@@ -14,6 +14,8 @@
 export const DEALS = "STAGING.HUBSPOT.STG_DEALS";
 export const REPORT = "KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2";
 export const START = "2023-01-01";
+/* Closed-won bookings come only from New Business (default) + XSell pipelines. */
+export const PIPES = "('default','702972541')";
 
 /* SQL string literal escape (single quotes). */
 const sq = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -48,6 +50,7 @@ deals AS (
          DEAL_ID
   FROM ${DEALS}
   WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL
+    AND PIPELINE_ID IN ${PIPES}
     AND PRODUCT IN (${slugs})
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
     AND TEAM_ID IN (SELECT mid FROM report_mids)
@@ -82,7 +85,7 @@ export function qDealTypes() {
     COUNT(DISTINCT PRODUCT_CLOUD) AS clouds,
     MAX(PRODUCT_CLOUD) AS product_cloud
   FROM ${DEALS}
-  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
+  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
     AND PRODUCT IS NOT NULL AND PRODUCT <> ''
   GROUP BY 1 ORDER BY n DESC`;
@@ -134,32 +137,33 @@ SELECT tm.type,
 FROM tm GROUP BY tm.type ORDER BY tm.type`;
 }
 
-/* ---- 5. No-match aggregate: closed-won deals with no report match ---- */
+/* ---- 5. Unmeasured/no-match aggregate ----
+   Every NB+XSell closed-won deal NOT in the matched grid: unmatched Redo ID OR a
+   product type with no mapped revenue column. Grid ARR + this reconciles to
+   HubSpot closed-won per cohort. */
 export function qNoMatchAgg(types) {
   const slugs = types.map((t) => sq(t.slug)).join(",");
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
 SELECT TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date,'YYYY-MM') AS cohort,
-  PRODUCT AS type, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr
+  COALESCE(NULLIF(PRODUCT,''),'(unmapped)') AS type, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr
 FROM ${DEALS}
-WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
+WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
   AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
-  AND PRODUCT IN (${slugs})
-  AND (TEAM_ID IS NULL OR TEAM_ID NOT IN (SELECT mid FROM report_mids))
+  AND NOT (TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) AND PRODUCT IN (${slugs}))
 GROUP BY 1,2 ORDER BY 1,2`;
 }
 
-/* ---- 6. No-match deals list: largest unmatched deals for the modal ---- */
-export function qNoMatchDeals(types, limit = 100) {
+/* ---- 6. Unmeasured/no-match deals list for the modal ---- */
+export function qNoMatchDeals(types, limit = 120) {
   const slugs = types.map((t) => sq(t.slug)).join(",");
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
 SELECT DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, COALESCE(TEAM_ID,'—') AS redo_id,
-  PRODUCT AS type, ROUND(DEAL_AMOUNT) AS arr,
+  COALESCE(NULLIF(PRODUCT,''),'(unmapped)') AS type, ROUND(DEAL_AMOUNT) AS arr,
   TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date,'YYYY-MM') AS cohort
 FROM ${DEALS}
-WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
+WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
   AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
-  AND PRODUCT IN (${slugs})
-  AND (TEAM_ID IS NULL OR TEAM_ID NOT IN (SELECT mid FROM report_mids))
+  AND NOT (TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) AND PRODUCT IN (${slugs}))
 ORDER BY DEAL_AMOUNT DESC NULLS LAST LIMIT ${limit}`;
 }
 
@@ -178,7 +182,7 @@ cohort_deals AS (
   SELECT DEAL_ID, DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, TEAM_ID AS mid,
          PRODUCT AS type, DEAL_AMOUNT AS arr
   FROM ${DEALS}
-  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL
+  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND PRODUCT IN (${slugs})
     AND TEAM_ID IN (SELECT mid FROM report_mids)
     AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date = DATE '${cohortDate}'
@@ -187,7 +191,7 @@ latest AS (
   SELECT TEAM_ID AS mid, PRODUCT AS type,
          MAX(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date) AS max_close
   FROM ${DEALS}
-  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL
+  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND PRODUCT IN (${slugs})
     AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date <= DATE '${monthDate}'
   GROUP BY 1,2

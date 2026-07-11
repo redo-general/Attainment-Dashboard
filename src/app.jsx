@@ -179,7 +179,7 @@ export default function App() {
               </h1>
               <div style={{ fontSize: 12, color: T.muted, marginTop: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <Database size={12} />
-                Live from Snowflake via Redo Unified{refreshedLabel ? ` · refreshed ${refreshedLabel}` : ""} · cohorts from Jan ’23 (MST) · current month is MTD
+                Live from Snowflake via Redo Unified{refreshedLabel ? ` · refreshed ${refreshedLabel}` : ""} · New Business + XSell · cohorts from Jan ’23 (MST) · current month is MTD
               </div>
             </div>
             <div style={{ display: "flex", gap: 8, paddingBottom: 4, flexWrap: "wrap" }}>
@@ -435,7 +435,7 @@ function CohortTable({ model, columns, view, metric, onCell, onNoMatch }) {
           <tr>
             <td style={{ position: "sticky", left: 0, zIndex: 1, background: T.surface, padding: "8px 16px", borderTop: `2px solid ${T.divider2}`, borderBottom: `1px solid ${T.divider}`, whiteSpace: "nowrap" }}>
               <button onClick={onNoMatch} style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: SANS, fontWeight: 600, fontSize: 13, color: T.muted, display: "inline-flex", alignItems: "center", gap: 8 }}>
-                <AlertTriangle size={13} /> No match · {model.nmTotals.n} deals
+                <AlertTriangle size={13} /> No match / unmapped · {model.nmTotals.n} deals
               </button>
             </td>
             <td style={{ ...num, borderTop: `2px solid ${T.divider2}`, color: T.muted }}>{fmtMoney(model.nmTotals.amt)}</td>

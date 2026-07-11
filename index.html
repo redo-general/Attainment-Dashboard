@@ -94,6 +94,8 @@ const nowMonthKey = () => new Intl.DateTimeFormat("en-CA",{timeZone:"America/Den
 
 /* ---------------- SQL generators ---------------- */
 const DEALS="STAGING.HUBSPOT.STG_DEALS", REPORT="KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2", START="2023-01-01";
+/* Closed-won bookings come only from the New Business (default) and XSell pipelines. */
+const PIPES = "('default','702972541')";
 const sq = s => `'${String(s).replace(/'/g,"''")}'`;
 const qid = s => `"${String(s).replace(/"/g,'""')}"`;
 const talias = slug => "t_"+slug.replace(/[^a-z0-9_]/gi,"_").toLowerCase();
@@ -109,6 +111,7 @@ deals AS (
          DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m, DEAL_ID
   FROM ${DEALS}
   WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL
+    AND PIPELINE_ID IN ${PIPES}
     AND PRODUCT IN (${slugs}) AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
     AND TEAM_ID IN (SELECT mid FROM report_mids))`;
 }
@@ -125,7 +128,7 @@ rev_long AS (
 rev AS (SELECT mid, m, type, SUM(rev) AS rev FROM rev_long GROUP BY 1,2,3)`;
 }
 const qDealTypes = () => `SELECT PRODUCT AS slug, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr, MAX(PRODUCT_CLOUD) AS product_cloud
-  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
+  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' AND PRODUCT IS NOT NULL AND PRODUCT <> ''
   GROUP BY 1 ORDER BY n DESC`;
 const qRevenueColumns = () => `SELECT column_name AS col FROM KITCHEN.INFORMATION_SCHEMA.COLUMNS
@@ -151,32 +154,36 @@ tm AS (SELECT type, m, SUM(rev) AS rev FROM rev GROUP BY 1,2)
 SELECT tm.type, ARRAY_AGG(ROUND(ZEROIFNULL(tm.rev))::int) WITHIN GROUP (ORDER BY tm.m) AS rev_arr,
   ARRAY_AGG(TO_CHAR(tm.m,'YYYY-MM')) WITHIN GROUP (ORDER BY tm.m) AS mon_arr
 FROM tm GROUP BY tm.type ORDER BY tm.type`;
+/* Unmeasured bucket: every NB+XSell closed-won deal NOT in the matched grid —
+   i.e. unmatched Redo ID OR a product type with no mapped revenue column. Grid
+   ARR + this bucket reconciles to HubSpot closed-won for the cohort. */
 const qNoMatchAgg = types => { const slugs=types.map(t=>sq(t.slug)).join(",");
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
 SELECT TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date,'YYYY-MM') AS cohort,
-  PRODUCT AS type, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr
-FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
-  AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' AND PRODUCT IN (${slugs})
-  AND (TEAM_ID IS NULL OR TEAM_ID NOT IN (SELECT mid FROM report_mids)) GROUP BY 1,2 ORDER BY 1,2`; };
-const qNoMatchDeals = (types, limit=100) => { const slugs=types.map(t=>sq(t.slug)).join(",");
+  COALESCE(NULLIF(PRODUCT,''),'(unmapped)') AS type, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr
+FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+  AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
+  AND NOT (TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) AND PRODUCT IN (${slugs}))
+  GROUP BY 1,2 ORDER BY 1,2`; };
+const qNoMatchDeals = (types, limit=120) => { const slugs=types.map(t=>sq(t.slug)).join(",");
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
 SELECT DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, COALESCE(TEAM_ID,'—') AS redo_id,
-  PRODUCT AS type, ROUND(DEAL_AMOUNT) AS arr,
+  COALESCE(NULLIF(PRODUCT,''),'(unmapped)') AS type, ROUND(DEAL_AMOUNT) AS arr,
   TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date,'YYYY-MM') AS cohort
-FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL
-  AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' AND PRODUCT IN (${slugs})
-  AND (TEAM_ID IS NULL OR TEAM_ID NOT IN (SELECT mid FROM report_mids))
+FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+  AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
+  AND NOT (TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) AND PRODUCT IN (${slugs}))
 ORDER BY DEAL_AMOUNT DESC NULLS LAST LIMIT ${limit}`; };
 const qCellDeals = (types, cohort, month) => { const slugs=types.map(t=>sq(t.slug)).join(",");
   const cd=`${cohort}-01`, md=`${month}-01`;
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} GROUP BY 1),
 cohort_deals AS (SELECT DEAL_ID, DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, TEAM_ID AS mid, PRODUCT AS type, DEAL_AMOUNT AS arr
-  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL
+  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND PRODUCT IN (${slugs}) AND TEAM_ID IN (SELECT mid FROM report_mids)
     AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date = DATE '${cd}'),
 latest AS (SELECT TEAM_ID AS mid, PRODUCT AS type, MAX(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date) AS max_close
-  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PRODUCT IN (${slugs})
+  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PIPELINE_ID IN ${PIPES} AND PRODUCT IN (${slugs})
     AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date <= DATE '${md}' GROUP BY 1,2),
 ${revLongCTE(types, `AND ${qid("Date")} = DATE '${md}'`)},
 alloc AS (SELECT cd.*, l.max_close, SUM(cd.arr) OVER (PARTITION BY cd.mid, cd.type) AS grp_arr
@@ -276,8 +283,13 @@ async function loadData(){
   }catch{ return null; }
 }
 
+/* A deal type is "unmeasured" when it has no mapped revenue column (excluded
+   types, empty PRODUCT, or discovered-but-unmapped). Such deals always belong
+   in the no-match/reconciliation bucket regardless of the selection. */
+const isUnmappedType = (config, t) => !(config && config.types[t] && config.types[t].cols && config.types[t].cols.length);
+
 /* ---------------- model ---------------- */
-function computeModel(data, selected){
+function computeModel(data, selected, config){
   const series = data.grid.filter(s=>selected.has(s.type));
   let last = START_MONTH;
   for(const s of data.grid){ const end=addMonths(s.cohort, s.exp.length-1); if(end>last) last=end; }
@@ -305,7 +317,7 @@ function computeModel(data, selected){
   for(const t of data.totalMapped){ const arr=Array(MONTHS.length).fill(0);
     t.months.forEach((mk,i)=>{const mi=MIDX[mk]; if(mi!=null)arr[mi]=t.rev[i]||0;}); REVT[t.type]=arr; }
   const unatt=MONTHS.map((_,mi)=>{ let u=0; selected.forEach(t=>{u+=Math.max(0,(REVT[t]?.[mi]||0)-(ATTR[t]?.[mi]||0));}); return u; });
-  const nm=data.noMatchAgg.filter(r=>selected.has(r.type));
+  const nm=data.noMatchAgg.filter(r=>selected.has(r.type) || isUnmappedType(config,r.type));
   const nmTotals=nm.reduce((a,r)=>({n:a.n+r.n,amt:a.amt+r.arr}),{n:0,amt:0});
   const nmByCohort={}; nm.forEach(r=>{nmByCohort[r.cohort]=(nmByCohort[r.cohort]||0)+r.arr;});
   let se=0,sa=0,jE=0,jA=0,totArr=0,totDeals=0; const jIdx=MIDX[detailMonth];
@@ -417,7 +429,7 @@ function render(){
   else if(state.phase==="busy" && !state.data) main.appendChild(Splash(state.busyMsg||"Working…", "spin"));
 
   if(state.data && state.config){
-    const model = computeModel(state.data, state.selected);
+    const model = computeModel(state.data, state.selected, state.config);
     state._model = model;
     if(state.phase==="busy") main.appendChild(h("div",{style:{fontSize:"12px",color:T.orange,marginBottom:"16px",display:"flex",gap:"8px",alignItems:"center"}}, spinIcon(), state.busyMsg));
     main.appendChild(ScopeBar(model));
@@ -448,7 +460,7 @@ function Header(){
   const titleWrap = h("div",{style:{marginRight:"auto"}},
     h("h1",{style:{margin:0,fontFamily:SERIF,fontWeight:400,fontSize:"48px",lineHeight:"56px",letterSpacing:"-0.02em"}},"Deal attainment"),
     h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"4px",display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}},
-      icon(IC.db,12), `Live from Snowflake via Redo Unified${refreshedLabel?` · refreshed ${refreshedLabel}`:""} · cohorts from Jan ’23 (MST) · current month is MTD`),
+      icon(IC.db,12), `Live from Snowflake via Redo Unified${refreshedLabel?` · refreshed ${refreshedLabel}`:""} · New Business + XSell · cohorts from Jan ’23 (MST) · current month is MTD`),
   );
   return h("header",{style:{borderBottom:`1px solid ${T.divider}`}},
     h("div",{style:{maxWidth:"1440px",margin:"0 auto",padding:"24px 48px 0"}},
@@ -589,7 +601,7 @@ function CohortTable(model){
   const nmTr=h("tr");
   nmTr.appendChild(h("td",{style:{position:"sticky",left:0,zIndex:1,background:T.surface,padding:"8px 16px",borderTop:`2px solid ${T.divider2}`,borderBottom:`1px solid ${T.divider}`,whiteSpace:"nowrap"}},
     h("button",{style:{background:"none",border:"none",cursor:"pointer",padding:0,fontWeight:600,fontSize:"13px",color:T.muted,display:"inline-flex",alignItems:"center",gap:"8px"}, onClick:()=>setState({modal:{kind:"nomatch"}})},
-      icon(IC.alert,13), `No match · ${model.nmTotals.n} deals`)));
+      icon(IC.alert,13), `No match / unmapped · ${model.nmTotals.n} deals`)));
   nmTr.appendChild(h("td",{style:{...num,borderTop:`2px solid ${T.divider2}`,color:T.muted}}, fmtMoney(model.nmTotals.amt)));
   nmTr.appendChild(h("td",{style:{...num,borderTop:`2px solid ${T.divider2}`,color:T.muted}}, model.nmTotals.n||"—"));
   columns.forEach(c=>{
@@ -690,9 +702,9 @@ function CellTable(rows, month, cfg){
 }
 function NoMatchModal(){
   const model=state._model, cfg=state.config;
-  const rows=(state.data.noMatchDeals||[]).filter(r=>state.selected.has(r.type));
+  const rows=(state.data.noMatchDeals||[]).filter(r=>state.selected.has(r.type) || isUnmappedType(cfg,r.type));
   const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px"}},
-    `${rows.length} of the largest unmatched deals match the current view (${model.nmTotals.n} unmatched deals in view, ${fmtMoney(model.nmTotals.amt)} ARR). Typically merchants not yet live, or a Redo ID typo in HubSpot.`);
+    `${rows.length} of the largest deals shown (${model.nmTotals.n} deals, ${fmtMoney(model.nmTotals.amt)} ARR in view). NB+XSell closed-won deals we can’t score — unmatched Redo ID (not yet live, or a typo) or a product type with no mapped revenue column.`);
   const table=h("table",{style:{width:"100%",borderCollapse:"collapse"}});
   table.appendChild(h("thead",null,h("tr",null,
     h("th",{style:thM()},"Deal"),h("th",{style:thM()},"Rep"),h("th",{style:thM()},"Redo ID"),h("th",{style:thM()},"Type"),h("th",{style:thM(1)},"Deal ARR"),h("th",{style:thM(1)},"Cohort"))));
@@ -706,7 +718,7 @@ function NoMatchModal(){
     h("td",{style:mtdNum}, keyToLabel(r.cohort)))));
   if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:6,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No unmatched deals in the current view.")));
   table.appendChild(tb);
-  return ModalShell("Unmatched deals","Deals with no Redo ID match",subtitle,table,()=>setState({modal:null}));
+  return ModalShell("Unmeasured closed-won","No match / unmapped deals",subtitle,table,()=>setState({modal:null}));
 }
 
 /* ---------------- config drawer ---------------- */
@@ -724,7 +736,7 @@ function ConfigDrawer(){
     const cols=availableCols(); const dd=dupes();
     const body=h("div",{style:{padding:"24px",fontSize:"13px",lineHeight:"20px"}});
     body.appendChild(Section("How it works", h("div",null,
-      Mono("STAGING.HUBSPOT.STG_DEALS")," (closed-won) joins ",Mono("KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2")," on Redo ID (",Mono("TEAM_ID")," = ",Mono("Merchant ID"),"). Expected monthly = deal ARR ÷ 12. Each deal type sums one or more revenue columns below; edit the mapping whenever the report’s columns change, then ",h("strong",{style:{color:T.text}},"Save & refresh"),".")));
+      Mono("STAGING.HUBSPOT.STG_DEALS")," (New Business + XSell, closed-won) joins ",Mono("KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2")," on Redo ID (",Mono("TEAM_ID")," = ",Mono("Merchant ID"),"). Expected monthly = deal ARR ÷ 12. Each deal type sums one or more revenue columns below; edit the mapping whenever the report’s columns change, then ",h("strong",{style:{color:T.text}},"Save & refresh"),".")));
     if(dd.length){
       const warn=h("div",{style:{border:`1px solid ${T.orange}`,background:"rgba(255,68,5,0.08)",padding:"10px 14px",marginBottom:"16px",fontSize:"12px",color:"#FFB59B",display:"flex",gap:"8px"}},
         icon(IC.alert,15), h("div",null, "Same revenue column mapped to multiple included types — this double-counts revenue:", dd.map(([c,ts])=>h("div",{style:{marginTop:"4px"}}, Mono(c)," → ",ts.join(", ")))));

@@ -242,8 +242,9 @@ export function computeModel(data, selected, config) {
     return u;
   });
 
-  // no match
-  const nm = data.noMatchAgg.filter((r) => selected.has(r.type));
+  // no match / unmapped — unmeasured types (no revenue column) always count
+  const isUnmapped = (t) => !(config && config.types[t] && config.types[t].cols && config.types[t].cols.length);
+  const nm = data.noMatchAgg.filter((r) => selected.has(r.type) || isUnmapped(r.type));
   const nmTotals = nm.reduce((a, r) => ({ n: a.n + r.n, amt: a.amt + r.arr }), { n: 0, amt: 0 });
   const nmByCohort = {};
   nm.forEach((r) => { nmByCohort[r.cohort] = (nmByCohort[r.cohort] || 0) + r.arr; });

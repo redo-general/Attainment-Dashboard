@@ -143,16 +143,17 @@ export function CellModal({ fridge, config, selected, cohort, month, model, onCl
 
 /* ---------------- No-match modal ---------------- */
 export function NoMatchModal({ config, data, selected, model, onClose }) {
-  const rows = (data.noMatchDeals || []).filter((r) => selected.has(r.type));
+  const isUnmapped = (t) => !(config && config.types[t] && config.types[t].cols && config.types[t].cols.length);
+  const rows = (data.noMatchDeals || []).filter((r) => selected.has(r.type) || isUnmapped(r.type));
   return (
     <ModalShell
-      eyebrow="Unmatched deals"
-      title="Deals with no Redo ID match"
+      eyebrow="Unmeasured closed-won"
+      title="No match / unmapped deals"
       onClose={onClose}
       subtitle={
         <div style={{ fontSize: 12, color: T.muted, marginTop: 8 }}>
-          {rows.length} of the largest unmatched deals match the current view ({model.nmTotals.n} unmatched deals in view,{" "}
-          {fmtMoney(model.nmTotals.amt)} ARR). Typically merchants not yet live, or a Redo ID typo in HubSpot.
+          {rows.length} of the largest deals shown ({model.nmTotals.n} deals, {fmtMoney(model.nmTotals.amt)} ARR in view).
+          NB+XSell closed-won deals we can’t score — unmatched Redo ID (not yet live, or a typo) or a product type with no mapped revenue column.
         </div>
       }
     >
@@ -246,7 +247,7 @@ export function ConfigDrawer({ config, discovered, data, onSave, onClose }) {
 
         <div style={{ padding: 24, fontSize: 13, lineHeight: "20px" }}>
           <Section label="How it works">
-            <Mono>STAGING.HUBSPOT.STG_DEALS</Mono> (closed-won) joins <Mono>KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2</Mono> on Redo ID
+            <Mono>STAGING.HUBSPOT.STG_DEALS</Mono> (New Business + XSell, closed-won) joins <Mono>KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2</Mono> on Redo ID
             (<Mono>TEAM_ID</Mono> = <Mono>Merchant ID</Mono>). Expected monthly = deal ARR ÷ 12. Each deal type sums one or more
             revenue columns below; edit the mapping whenever the report’s columns change, then <strong style={{ color: T.text }}>Save &amp; refresh</strong>.
           </Section>
