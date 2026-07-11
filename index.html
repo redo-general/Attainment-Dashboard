@@ -65,7 +65,7 @@ const DEFAULT_TYPES = {
   order_tracking:{name:"Order Tracking",cloud:"mktg",cols:["Order Tracking Revenue"]},
   checkout_optimization:{name:"Checkout Optimization",cloud:"conv",cols:["Checkout Optimization Revenue"]},
   shopperai:{name:"Shopper AI",cloud:"conv",cols:["Shopper AI Revenue"]},
-  helpdesk:{name:"Helpdesk",cloud:"plat",cols:["Helpdesk Revenue"]},
+  helpdesk:{name:"Helpdesk",cloud:"plat",cols:["Helpdesk Revenue","Support AI Revenue"]},
   aeo:{name:"AEO",cloud:"plat",cols:["AEO Revenue"]},
   reclaim:{name:"Reclaim",cloud:"plat",cols:["Reclaim Revenue"]},
   landed_cost:{name:"Landed Cost",cloud:"plat",cols:["Landed Cost Revenue"]},
@@ -399,6 +399,26 @@ function mergeDiscovery(config, disc){
     cfg.types[dt.slug].count=dt.n; cfg.types[dt.slug].arr=dt.arr;
   }
   return cfg;
+}
+/* One-time migrations for changes to the default deal-type -> revenue-column
+   mapping, applied to a user's saved config without wiping their own edits. A
+   deal type can map MULTIPLE revenue columns (many-to-one) — they are summed —
+   so a product that bundles several revenue streams just lists them all.
+   mig 1: Helpdesk deals also generate Support AI revenue, so pair "Support AI
+   Revenue" onto the helpdesk type (Platform cloud = Helpdesk + Support AI + AEO
+   + Reclaim exactly). Returns true when it actually changed a mapping (so the
+   caller can re-query the now-stale cached grid). */
+const CONFIG_MIG = 1;
+function migrateConfig(cfg){
+  let changed=false;
+  if((cfg.mig||0) < 1){
+    const h = cfg.types && cfg.types.helpdesk;
+    if(h && Array.isArray(h.cols) && !h.cols.includes("Support AI Revenue")){
+      h.cols.push("Support AI Revenue"); changed=true;
+    }
+  }
+  cfg.mig = CONFIG_MIG;
+  return changed;
 }
 /* Mapped types = enabled types with a revenue column (drive attributed revenue). */
 const mappedTypes = config => config.order.filter(s=>config.types[s].on && config.types[s].cols && config.types[s].cols.length).map(s=>({slug:s,cols:config.types[s].cols}));
@@ -782,8 +802,15 @@ function prefetchCell(cohort, month, merchant){
     try{ user = await fridge.identity.me(); }catch{}
     const savedCfg = await loadConfig();
     const cfg = (savedCfg && savedCfg.order) ? savedCfg : seedConfig();
+    const migrated = migrateConfig(cfg);
+    if(migrated){ try{ await saveConfig(cfg); }catch(e){ console.warn("config migrate save failed", e); } }
     const cached = await loadData();
-    if(cached && cached.grid){ setState({ config:cfg, data:cached, selected:defaultSelection(cfg, cached), phase:"ready" }); }
+    if(cached && cached.grid){
+      setState({ config:cfg, data:cached, selected:defaultSelection(cfg, cached), phase:"ready" });
+      // A mapping migration makes the cached grid stale, so re-query in the
+      // background; the cached numbers show instantly and update when it lands.
+      if(migrated) doRefresh(cfg);
+    }
     else { setState({ config:cfg, phase:"needsConnect" }); }
   }catch(e){ setState({ error:String(e?.message||e), phase:"error" }); }
 })();
