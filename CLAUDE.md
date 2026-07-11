@@ -25,6 +25,24 @@ fridge_publish_site_files({
 It commits server-side through hidden Git, then a build worker deploys it. The
 commit is instant; the worker is what varies.
 
+### CRITICAL: use the `html` param, NOT `files`/`contentBase64`
+
+Pass the file through the **`html`** string parameter. Do **not** use the
+`files: [{ contentBase64 }]` path for this ~115 KB single file — that path
+**truncates around 8 KB**, silently publishing a broken partial file (seen it
+ship a 318-byte `index.html` that white-screened the site). The `html` param
+reliably carries the whole file in one call. After publishing, **always verify
+`deployment.metadata.totalBytes === wc -c index.html`** before forcing the
+build; if it's smaller, the upload truncated — do not proceed, re-publish.
+
+If a bad/truncated file did go live, recover instantly without re-uploading:
+`fridge_rollback_site({ slug, deploymentId: <last good deployment UUID>,
+confirmRollback: true })` (get the UUID from `fridge_list_deployments`). Then
+re-publish via `html`. Deploying from a Claude session? Have the subagent use
+`html` only and verify `totalBytes` + the deployed `sha256` each attempt, and
+roll back to the last-good deployment on any mismatch so the live site is never
+left broken.
+
 ### Deploy FAST — force the build, verify by sha, do NOT poll status
 
 The slow part is never the build (~2s). It's two traps that cost ~5 min if you
