@@ -140,6 +140,7 @@ const qRevenueColumns = () => `SELECT column_name AS col FROM KITCHEN.INFORMATIO
    deals coexist); revenue is credited once per merchant+type (latest cohort). */
 const qGrid = (types, span) => `WITH
 months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
+lastm AS (SELECT MAX(m) AS m FROM months),
 report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 deals AS (
   SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr, DEAL_ID,
@@ -149,10 +150,15 @@ deals AS (
   WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'),
 grp AS (SELECT akey, mid, type, close_m, SUM(arr) AS arr, COUNT(DISTINCT DEAL_ID) AS ndeals FROM deals GROUP BY 1,2,3,4),
-grp_months AS (SELECT g.mid, g.type, g.close_m, g.arr, g.ndeals, mo.m,
-    ROW_NUMBER() OVER (PARTITION BY g.akey, g.type, mo.m ORDER BY g.close_m DESC) AS rn
-  FROM grp g JOIN months mo ON mo.m >= g.close_m),
-active AS (SELECT mid, type, m, close_m AS cohort, arr, ndeals FROM grp_months WHERE rn = 1),
+/* Each (akey,type) group is the active deal from its close month until the next
+   same-key deal closes (latest deal wins). A range-join to months expands only
+   that window, avoiding a group×month cross product + ranking (which timed out
+   on the runtime warehouse). Non-overlapping consecutive windows == rn=1. */
+grp_win AS (SELECT mid, type, akey, close_m, arr, ndeals,
+    COALESCE(DATEADD(month,-1, LEAD(close_m) OVER (PARTITION BY akey, type ORDER BY close_m)), (SELECT m FROM lastm)) AS end_m
+  FROM grp),
+active AS (SELECT g.mid, g.type, g.close_m AS cohort, mo.m AS m, g.arr, g.ndeals
+  FROM grp_win g JOIN months mo ON mo.m >= g.close_m AND mo.m <= g.end_m),
 ${revLongCTE(types)},
 joined AS (SELECT a.cohort, a.type, a.m, a.arr/12 AS expected, COALESCE(r.rev,0) AS actual, a.ndeals
   FROM active a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type AND r.m=a.m),
