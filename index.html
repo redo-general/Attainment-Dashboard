@@ -455,7 +455,11 @@ const state = {
   typesOpen:false, modal:null, drawer:false,
   repFilter:"__all__", excludeM0:false, project:false, showEarly:false,
   excluded:new Set(), merchants:null, merchantsOpen:false, merchantsLoading:false,
+  advancedOpen:false, runRate:false,
 };
+/* Run-rate view: displayed monthly $ are ×12 (annualized). Attainment ratios are
+   unchanged since both numerator and denominator scale together. */
+const rrMult = () => state.runRate ? 12 : 1;
 const defaultSelection = (cfg, data) => { const gt=gridTypes(data); return new Set(gt.length ? gt : cfg.order.filter(s=>cfg.types[s].cols && cfg.types[s].cols.length)); };
 function setState(patch){ Object.assign(state, patch); render(); }
 
@@ -463,6 +467,7 @@ function setState(patch){ Object.assign(state, patch); render(); }
 async function doRefresh(cfgOverride){
   if(!fridge) return;
   const cfg = cfgOverride || state.config;
+  cellCache.clear();
   setState({ phase:"busy", error:null, busyMsg:"Discovering deal types & revenue columns…" });
   try{
     const disc = await discover();
@@ -485,6 +490,7 @@ async function doRefresh(cfgOverride){
 async function applyExclusions(){
   if(!fridge || !state.config || !state.data) return;
   const ex=[...state.excluded];
+  cellCache.clear();
   setState({ phase:"busy", error:null, busyMsg: ex.length?`Recomputing without ${ex.length} merchant${ex.length>1?"s":""}…`:"Restoring all merchants…" });
   try{
     const filtered = await gridWithExclusions(state.config, state.data.nowKey, ex);
@@ -508,6 +514,30 @@ async function saveConfigAndRefresh(newCfg){
   try{ await saveConfig(newCfg); }catch(e){ console.warn("config cache failed", e); }
   setState({ config:newCfg, selected:new Set(), drawer:false });
   await doRefresh(newCfg);
+}
+
+/* Cell-modal prefetch: the deal list for a cell is a live Snowflake query, so
+   kick it off on hover (with a short hover-intent delay) and cache the promise
+   keyed by cohort+month+selected-types+exclusions. By the time the click lands
+   the modal usually reads a resolved promise and renders instantly. Rep filter
+   is applied client-side afterward, so it is NOT part of the key. Cleared on
+   refresh / exclusion change so stale merchant names never linger. */
+const cellCache = new Map();
+function cellKey(cohort, month){
+  const slugs=(state.types||[]).filter(s=>state.selected.has(s)).slice().sort().join(",");
+  const ex=[...state.excluded].sort().join(",");
+  return `${cohort}|${month}|${slugs}|${ex}`;
+}
+function prefetchCell(cohort, month){
+  const key=cellKey(cohort,month);
+  if(cellCache.has(key)) return cellCache.get(key);
+  const allSlugs=(state.types||[]).filter(s=>state.selected.has(s));
+  if(!allSlugs.length){ const p=Promise.resolve([]); cellCache.set(key,p); return p; }
+  const mt=mappedTypes(state.config).filter(t=>state.selected.has(t.slug));
+  const p=runSql(qCellDeals(mt,allSlugs,cohort,month,[...state.excluded]), ["name","rep","merchant","type","arr","actual","active","matched"])
+    .catch(err=>{ cellCache.delete(key); throw err; });
+  cellCache.set(key,p);
+  return p;
 }
 
 /* ---------------- boot ---------------- */
@@ -650,8 +680,27 @@ function checkBox(on, size=14){
   return box;
 }
 /* ---------------- filters / view controls ---------------- */
+/* Advanced controls (rep / merchant / M0 / run-rate / calendar options) are the
+   power-user knobs most people never touch, so they live behind a collapsible
+   "Advanced" toggle to keep the default UI clean. The toggle badges how many are
+   active so hidden-but-on filters stay visible. */
 function ControlsBar(model){
-  const wrap=h("div",{style:{display:"flex",gap:"8px",flexWrap:"wrap",alignItems:"center",marginTop:"16px",position:"relative"}});
+  const cal = state.view==="cal";
+  const activeCount = (state.repFilter!=="__all__"?1:0) + (state.excluded.size?1:0)
+    + (state.excludeM0?1:0) + (state.runRate?1:0)
+    + (cal && state.project?1:0) + (cal && state.showEarly?1:0);
+  const bar=h("div",{style:{marginTop:"16px"}});
+  const advBtn=h("button",{style:{...btnStyle(state.advancedOpen||activeCount>0), gap:"8px"},
+    onClick:()=>setState({advancedOpen:!state.advancedOpen})},
+    icon(IC.sliders,13), `Advanced${activeCount?` · ${activeCount} on`:""}`,
+    h("span",{style:{fontSize:"9px",color:state.advancedOpen||activeCount?T.page:T.muted}}, state.advancedOpen?"▲":"▼"));
+  bar.appendChild(advBtn);
+  if(!state.advancedOpen) return bar;
+
+  const wrap=h("div",{style:{display:"flex",gap:"8px",flexWrap:"wrap",alignItems:"center",marginTop:"12px",padding:"16px",border:`1px solid ${T.divider}`,background:T.surface,position:"relative"}});
+
+  // Revenue ↔ run-rate: annualize displayed monthly $ (×12); attainment unchanged.
+  wrap.appendChild(h("button",{style:btnStyle(state.runRate), title:"Run-rate view: multiply the monthly $ shown in the table and detail modals by 12 to annualize them. Attainment % is unchanged.", onClick:()=>setState({runRate:!state.runRate})}, state.runRate?"$ = Run-rate (×12)":"$ = Revenue (monthly)"));
 
   // Rep filter (fix: sort/filter by which rep closed the deal, default all)
   const reps=model.reps||[];
@@ -671,13 +720,14 @@ function ControlsBar(model){
   // Exclude M0 toggle (fix: drop ramping month-0 from the totals)
   wrap.appendChild(h("button",{style:btnStyle(state.excludeM0), title:"Exclude each cohort's first month (M0) from attainment totals so ramping cohorts don't drag them down.", onClick:()=>setState({excludeM0:!state.excludeM0})}, state.excludeM0?"M0 excluded":"Exclude M0"));
 
-  if(state.view==="cal"){
+  if(cal){
     // Project current month (fix: MTD → projected toggle)
     wrap.appendChild(h("button",{style:btnStyle(state.project), title:"Project the current partial month to a full-month run-rate (scales MTD by days elapsed).", onClick:()=>setState({project:!state.project})}, state.project?"Projecting month":"Project month"));
     // Show earlier months (fix: default to Jan '25 onward with expand button)
     wrap.appendChild(h("button",{style:btnStyle(state.showEarly), onClick:()=>setState({showEarly:!state.showEarly})}, state.showEarly?"Hide pre-2025":"Show earlier months"));
   }
-  return wrap;
+  bar.appendChild(wrap);
+  return bar;
 }
 function MerchantPanel(){
   const wrapStyle={position:"absolute",top:"calc(100% + 8px)",left:0,zIndex:41,background:T.surface,border:`1px solid ${T.divider2}`,padding:"16px",width:"min(460px, 92vw)",display:"flex",flexDirection:"column"};
@@ -793,9 +843,9 @@ function CohortTable(model){
     if(projectCol(col.key)) a *= factor;
     const pct = e>0?a/e:(a>0?Infinity:null);
     if(e<=0 && a===0){ totTr.appendChild(h("td",{style:{...num,...totBorder,color:"rgba(255,255,255,0.14)"}},"·")); return; }
-    const hh=heat(pct);
-    totTr.appendChild(h("td",{style:{...num,...totBorder,background:hh.bg,color:hh.fg,fontWeight:700}, title:`Total ${cal?keyToLabel(col.key):col.label}\nExpected ${fmtMoneyFull(e)} · Actual ${fmtMoneyFull(a)}`},
-      state.metric==="pct"?(pct===Infinity?"∞":fmtPct(pct)):fmtMoney(a)));
+    const hh=heat(pct); const rr=rrMult();
+    totTr.appendChild(h("td",{style:{...num,...totBorder,background:hh.bg,color:hh.fg,fontWeight:700}, title:`Total ${cal?keyToLabel(col.key):col.label}\nExpected ${fmtMoneyFull(e*rr)} · Actual ${fmtMoneyFull(a*rr)}`},
+      state.metric==="pct"?(pct===Infinity?"∞":fmtPct(pct)):fmtMoney(a*rr)));
   });
   tbody.appendChild(totTr);
 
@@ -812,11 +862,14 @@ function CohortTable(model){
       if(e<=0 && a===0){ tr.appendChild(h("td",{style:{...num,color:"rgba(255,255,255,0.14)"}},"·")); return; }
       const m = cal?col.key:addMonths(r.c,i);
       if(projectCol(m)) a *= factor;
-      const pct = e>0?a/e:(a>0?Infinity:null); const hh=heat(pct);
-      const cell=h("button",{class:"cell", title:`${keyToLabel(r.c)} cohort · ${keyToLabel(m)}${projectCol(m)?" · projected":""}\nExpected ${fmtMoneyFull(e)} · Actual ${fmtMoneyFull(a)} · ${d} active`,
+      const pct = e>0?a/e:(a>0?Infinity:null); const hh=heat(pct); const rr=rrMult();
+      let hoverT=null;
+      const cell=h("button",{class:"cell", title:`${keyToLabel(r.c)} cohort · ${keyToLabel(m)}${projectCol(m)?" · projected":""}\nExpected ${fmtMoneyFull(e*rr)} · Actual ${fmtMoneyFull(a*rr)} · ${d} active`,
         style:{width:"100%",border:"none",cursor:"pointer",background:hh.bg,color:hh.fg,fontVariantNumeric:"tabular-nums",fontSize:"11px",fontWeight:600,padding:"6px",textAlign:"right"},
+        onMouseenter:()=>{ hoverT=setTimeout(()=>prefetchCell(r.c, m), 120); },
+        onMouseleave:()=>{ if(hoverT){ clearTimeout(hoverT); hoverT=null; } },
         onClick:()=>setState({modal:{kind:"cell",cohort:r.c,month:m}})},
-        state.metric==="pct"?(pct===Infinity?"∞":fmtPct(pct)):fmtMoney(a));
+        state.metric==="pct"?(pct===Infinity?"∞":fmtPct(pct)):fmtMoney(a*rr));
       tr.appendChild(h("td",{style:{padding:"2px",borderBottom:`1px solid ${T.divider}`}}, cell));
     });
     tbody.appendChild(tr);
@@ -833,9 +886,10 @@ function CohortTable(model){
     let v=model.unatt[model.MIDX[c.key]]||0;
     if(projectCol(c.key)) v *= factor;
     if(v<1){ unTr.appendChild(h("td",{style:{...num,...utTop,color:"rgba(255,255,255,0.14)"}},"·")); return; }
-    const btn=h("button",{class:"cell", title:`Orphaned revenue · ${keyToLabel(c.key)}${projectCol(c.key)?" · projected":""}\n${fmtMoneyFull(v)} — click for merchants`,
+    const rr=rrMult();
+    const btn=h("button",{class:"cell", title:`Orphaned revenue · ${keyToLabel(c.key)}${projectCol(c.key)?" · projected":""}\n${fmtMoneyFull(v*rr)} — click for merchants`,
       style:{width:"100%",border:"none",cursor:"pointer",background:"transparent",color:T.blue,fontVariantNumeric:"tabular-nums",fontSize:"11px",fontWeight:600,padding:"6px",textAlign:"right"},
-      onClick:()=>setState({modal:{kind:"orphan",month:c.key}})}, fmtMoney(v));
+      onClick:()=>setState({modal:{kind:"orphan",month:c.key}})}, fmtMoney(v*rr));
     unTr.appendChild(h("td",{style:{padding:"2px",...utTop,borderBottom:`1px solid ${T.divider}`}}, btn));
   });
   tbody.appendChild(unTr);
@@ -871,9 +925,9 @@ function CellModal(m){
   const row=model.rows.find(r=>r.c===m.cohort);
   const i=row?monthDiff(m.cohort,m.month):-1;
   const e=row&&i>=0&&i<row.span?row.exp[i]:0, a=row&&i>=0&&i<row.span?row.act[i]:0, d=row&&i>=0&&i<row.span?row.dls[i]:0;
-  const pct=e>0?a/e:null;
+  const pct=e>0?a/e:null; const rr=rrMult();
   const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px",fontVariantNumeric:"tabular-nums"}},
-    `Cell: expected ${fmtMoneyFull(e)} · actual ${fmtMoneyFull(a)} · `,
+    `Cell: expected ${fmtMoneyFull(e*rr)} · actual ${fmtMoneyFull(a*rr)}${state.runRate?" (run-rate)":""} · `,
     h("span",{style:{color:T.text,fontWeight:600}}, `${fmtPct(pct)} attained`), ` · ${d} active in view`);
   const body=h("div");
   body.appendChild(h("div",{style:{padding:"16px 24px 0",fontSize:"12px",color:T.muted,lineHeight:"20px"}},
@@ -881,13 +935,13 @@ function CellModal(m){
   const slot=h("div",{style:{padding:"48px",textAlign:"center",color:T.muted,fontSize:"13px",display:"flex",gap:"10px",justifyContent:"center",alignItems:"center"}}, spinIcon(), "Querying deals…");
   body.appendChild(slot);
   const close=()=>setState({modal:null});
-  // fire live query — all deals in the cohort of the selected types (matched or not)
+  // Uses the hover-prefetched cache when available, so the modal renders instantly;
+  // otherwise the query starts now. Rep filter is applied client-side after.
   const allSlugs=(state.types||[]).filter(s=>state.selected.has(s));
-  const mt=mappedTypes(cfg).filter(t=>state.selected.has(t.slug));
   (async()=>{
     try{
       if(!allSlugs.length){ slot.replaceWith(emptyCell()); return; }
-      let rows=await runSql(qCellDeals(mt,allSlugs,m.cohort,m.month,[...state.excluded]), ["name","rep","merchant","type","arr","actual","active","matched"]);
+      let rows=await prefetchCell(m.cohort, m.month);
       if(state.repFilter!=="__all__") rows=rows.filter(r=>(r.rep||"—")===state.repFilter);
       slot.replaceWith(CellTable(rows,m.month,cfg));
     }catch(err){
@@ -899,10 +953,11 @@ function CellModal(m){
 }
 function emptyCell(){ return h("div",{style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No matched deals for this cohort in the current deal-type view."); }
 function CellTable(rows, month, cfg){
+  const rr=rrMult();
   const table=h("table",{style:{width:"100%",borderCollapse:"collapse",marginTop:"8px"}});
   table.appendChild(h("thead",null,h("tr",null,
     h("th",{style:thM()},"Deal"),h("th",{style:thM()},"Rep"),h("th",{style:thM()},"Merchant"),h("th",{style:thM()},"Type"),
-    h("th",{style:thM(1)},"Deal ARR"),h("th",{style:thM(1)},"Expected / mo"),h("th",{style:thM(1)},`Actual (${keyToLabel(month)})`),h("th",{style:thM(1)},"Attainment"))));
+    h("th",{style:thM(1)},"Deal ARR"),h("th",{style:thM(1)}, state.runRate?"Expected / yr":"Expected / mo"),h("th",{style:thM(1)},`Actual (${keyToLabel(month)})${state.runRate?" ·/yr":""}`),h("th",{style:thM(1)},"Attainment"))));
   const tb=h("tbody");
   rows.forEach(r=>{
     const active=Number(r.active)===1, arr=num(r.arr), actual=r.actual==null?null:num(r.actual), expected=arr/12;
@@ -916,8 +971,8 @@ function CellTable(rows, month, cfg){
       h("td",{style:mtd}, r.merchant),
       h("td",{style:mtd}, typeName(cfg,r.type)),
       h("td",{style:mtdNum}, fmtMoneyFull(arr)),
-      h("td",{style:mtdNum}, fmtMoneyFull(expected)),
-      h("td",{style:mtdNum}, active&&actual!=null?fmtMoneyFull(actual):"—"),
+      h("td",{style:mtdNum}, fmtMoneyFull(expected*rr)),
+      h("td",{style:mtdNum}, active&&actual!=null?fmtMoneyFull(actual*rr):"—"),
       h("td",{style:mtdNum}, p!=null?h("span",{style:{background:hh.bg,color:hh.fg,padding:"2px 8px",fontWeight:600}}, fmtPct(p)):"—")));
   });
   if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:8,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No matched deals for this cohort in the current deal-type view.")));
@@ -928,9 +983,9 @@ function CellTable(rows, month, cfg){
    closed-won deal of that type behind it, for one calendar month. */
 function OrphanModal(m){
   const cfg=state.config, model=state._model;
-  const total=model.unatt[model.MIDX[m.month]]||0;
+  const total=(model.unatt[model.MIDX[m.month]]||0)*rrMult();
   const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px",fontVariantNumeric:"tabular-nums"}},
-    `Total orphaned in view: `, h("span",{style:{color:T.blue,fontWeight:600}}, fmtMoneyFull(total)));
+    `Total orphaned in view: `, h("span",{style:{color:T.blue,fontWeight:600}}, fmtMoneyFull(total)), state.runRate?" (run-rate)":"");
   const body=h("div");
   body.appendChild(h("div",{style:{padding:"16px 24px 0",fontSize:"12px",color:T.muted,lineHeight:"20px"}},
     `Mapped-column revenue for ${keyToLabel(m.month)} from merchants with no closed-won NB+XSell deal of that type on or before the month — the revenue with no cohort behind it. Queried live from Snowflake.`));
@@ -951,22 +1006,23 @@ function OrphanModal(m){
   return ModalShell("Orphaned revenue · live", `${keyToLabel(m.month)} · no deal behind it`, subtitle, body, close);
 }
 function OrphanTable(rows, cfg){
+  const rr=rrMult();
   const table=h("table",{style:{width:"100%",borderCollapse:"collapse",marginTop:"8px"}});
   table.appendChild(h("thead",null,h("tr",null,
-    h("th",{style:thM()},"Merchant"),h("th",{style:thM()},"Revenue type"),h("th",{style:thM(1)},"Revenue"))));
+    h("th",{style:thM()},"Merchant"),h("th",{style:thM()},"Revenue type"),h("th",{style:thM(1)}, state.runRate?"Revenue ·/yr":"Revenue"))));
   const tb=h("tbody");
   const tot=rows.reduce((s,r)=>s+num(r.rev),0);
   rows.forEach(r=>{
     tb.appendChild(h("tr",null,
       h("td",{style:{...mtd,color:T.text}}, r.merchant),
       h("td",{style:mtd}, typeName(cfg,r.type)),
-      h("td",{style:mtdNum,}, fmtMoneyFull(num(r.rev)))));
+      h("td",{style:mtdNum,}, fmtMoneyFull(num(r.rev)*rr))));
   });
   if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:3,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No orphaned revenue for this month in the current view.")));
   else tb.appendChild(h("tr",{style:{borderTop:`2px solid ${T.divider2}`}},
     h("td",{style:{...mtd,color:T.text,fontWeight:600}},`${rows.length} merchant${rows.length>1?"s":""}`),
     h("td",{style:mtd},""),
-    h("td",{style:{...mtdNum,color:T.blue,fontWeight:700}}, fmtMoneyFull(tot))));
+    h("td",{style:{...mtdNum,color:T.blue,fontWeight:700}}, fmtMoneyFull(tot*rr))));
   table.appendChild(tb);
   return table;
 }
