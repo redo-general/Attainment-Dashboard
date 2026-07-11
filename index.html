@@ -237,6 +237,87 @@ const qMerchants = () => `SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Mer
   ROUND(SUM(ZEROIFNULL(${qid("Total Revenue")}))) AS rev
   FROM ${REPORT} GROUP BY 1 ORDER BY 3 DESC NULLS LAST`;
 
+/* ---- Merchant-grain rollup (the "All products" view) ----
+   Summing per-product revenue columns double-counts, because the report's
+   product columns share underlying line items (Total Revenue = the 6 Cloud
+   columns, but the products inside a cloud overlap ~8%). To make "All products"
+   reconcile EXACTLY to Total Revenue, the rollup measures revenue once per
+   merchant via the single "Total Revenue" column and attributes it at merchant
+   grain: a merchant's cohort is the close month of their latest NB+XSell deal
+   (any product; latest deal wins), their bookings = that cohort event's summed
+   ARR, and their monthly Total Revenue is credited to that cohort. Merchants with
+   no deal on/before a month are Orphaned. The type dimension collapses to a
+   single '__all__' bucket so the same computeModel/table code renders it. */
+const qMerchantGrid = (span, excluded=[], lo=1, hi=500) => `WITH
+months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
+lastm AS (SELECT MAX(m) AS m FROM months),
+report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
+deals AS (
+  SELECT TEAM_ID AS mid, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
+    DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
+    CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
+  FROM ${DEALS}
+  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+    AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' ${notInTeam(excluded)}),
+grp AS (SELECT akey, mid, close_m, SUM(arr) AS arr, COUNT(DISTINCT DEAL_ID) AS ndeals, MAX_BY(rep, arr) AS rep FROM deals GROUP BY 1,2,3),
+grp_win AS (SELECT mid, akey, close_m, arr, ndeals, rep,
+    COALESCE(DATEADD(month,-1, LEAD(close_m) OVER (PARTITION BY akey ORDER BY close_m)), (SELECT m FROM lastm)) AS end_m
+  FROM grp),
+active AS (SELECT g.mid, g.close_m AS cohort, mo.m AS m, g.arr, g.ndeals, g.rep
+  FROM grp_win g JOIN months mo ON mo.m >= g.close_m AND mo.m <= g.end_m),
+totrev AS (SELECT ${qid("Merchant ID")} AS mid, ${qid("Date")} AS m, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev
+  FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)} AND ${qid("Merchant ID")} IN (SELECT mid FROM deals) GROUP BY 1,2),
+joined AS (SELECT a.cohort, a.rep, a.m, a.arr/12 AS expected, COALESCE(r.rev,0) AS actual, a.ndeals
+  FROM active a LEFT JOIN totrev r ON r.mid=a.mid AND r.m=a.m),
+per_month AS (SELECT cohort, rep, m, SUM(expected) AS expected, SUM(actual) AS actual, SUM(ndeals) AS deals
+  FROM joined GROUP BY 1,2,3)
+SELECT TO_CHAR(cohort,'YYYY-MM') AS cohort, '__all__' AS type, rep,
+  ARRAY_AGG(ROUND(expected)::int) WITHIN GROUP (ORDER BY m) AS exp_arr,
+  ARRAY_AGG(ROUND(actual)::int)   WITHIN GROUP (ORDER BY m) AS act_arr,
+  ARRAY_AGG(deals)                WITHIN GROUP (ORDER BY m) AS cnt_arr
+FROM per_month GROUP BY cohort, rep
+QUALIFY ROW_NUMBER() OVER (ORDER BY cohort, rep) BETWEEN ${lo} AND ${hi}
+ORDER BY cohort, rep`;
+/* Total measured revenue per month across ALL report merchants (minus excluded).
+   This is the reconciliation basis: orphaned = this minus attributed. */
+const qTotalRevenue = (excluded=[]) => `SELECT '__all__' AS type,
+  ARRAY_AGG(rev) WITHIN GROUP (ORDER BY m) AS rev_arr,
+  ARRAY_AGG(TO_CHAR(m,'YYYY-MM')) WITHIN GROUP (ORDER BY m) AS mon_arr
+FROM (SELECT ${qid("Date")}::date AS m, ROUND(SUM(ZEROIFNULL(${qid("Total Revenue")})))::int AS rev
+  FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)} GROUP BY 1)`;
+/* Merchant-level detail for a rollup cohort cell: every merchant whose latest
+   deal on/before the month closed in this cohort, with bookings vs their Total
+   Revenue for the month. */
+const qMerchantCellDeals = (cohort, month, excluded=[]) => {
+  const cd=`${cohort}-01`, md=`${month}-01`;
+  return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
+mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' GROUP BY 1),
+mrev AS (SELECT ${qid("Merchant ID")} AS mid, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' ${notInMids(excluded)} GROUP BY 1),
+alld AS (SELECT TEAM_ID AS mid, COALESCE(NULLIF(AE_NAME,''),'—') AS rep, DEAL_AMOUNT AS arr, DEAL_ID,
+    DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
+    CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN 1 ELSE 0 END AS matched,
+    CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
+  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+    AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' ${notInTeam(excluded)}),
+latest AS (SELECT akey, MAX(close_m) AS max_close FROM alld WHERE close_m <= DATE '${md}' GROUP BY 1),
+cohort_m AS (SELECT akey FROM latest WHERE max_close = DATE '${cd}'),
+booked AS (SELECT a.akey, MAX_BY(a.mid, a.arr) AS mid, MAX_BY(a.rep, a.arr) AS rep, SUM(a.arr) AS arr, MAX(a.matched) AS matched
+  FROM alld a WHERE a.close_m = DATE '${cd}' AND a.akey IN (SELECT akey FROM cohort_m) GROUP BY 1)
+SELECT COALESCE(mn.name, b.mid, '—') AS merchant, b.rep, ROUND(b.arr) AS arr, ROUND(COALESCE(mr.rev,0)) AS actual, b.matched
+FROM booked b LEFT JOIN mnames mn ON mn.mid=b.mid LEFT JOIN mrev mr ON mr.mid=b.mid
+ORDER BY b.arr DESC NULLS LAST LIMIT 500`; };
+/* Orphaned (rollup): merchants with Total Revenue in the month but no closed-won
+   NB+XSell deal on/before it — the revenue with no cohort behind it. */
+const qOrphanMerchants = (month, excluded=[]) => {
+  const md=`${month}-01`;
+  return `WITH mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' GROUP BY 1),
+dealset AS (SELECT DISTINCT TEAM_ID AS mid FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+    AND TEAM_ID IS NOT NULL AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date <= DATE '${md}'),
+mrev AS (SELECT ${qid("Merchant ID")} AS mid, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' ${notInMids(excluded)} GROUP BY 1)
+SELECT COALESCE(mn.name, r.mid, '—') AS merchant, ROUND(r.rev) AS rev
+FROM mrev r LEFT JOIN dealset d ON d.mid=r.mid LEFT JOIN mnames mn ON mn.mid=r.mid
+WHERE d.mid IS NULL AND r.rev >= 1 ORDER BY r.rev DESC LIMIT 500`; };
+
 /* ---------------- data helpers ---------------- */
 function toObj(row, cols){
   if(Array.isArray(row)){ const o={}; cols.forEach((c,i)=>o[c]=row[i]); return o; }
@@ -299,17 +380,32 @@ async function fetchGridPaged(mt, span, excluded){
   }
   return out;
 }
+/* Merchant-grain rollup grid (the "All products" view), paged like the product grid. */
+async function fetchMerchantGridPaged(span, excluded){
+  const out=[];
+  for(let p=0; p<200; p++){
+    const lo=p*GRID_PAGE+1, hi=(p+1)*GRID_PAGE;
+    const rows = await runSql(qMerchantGrid(span,excluded,lo,hi), GRID_COLS, GRID_PAGE);
+    out.push(...rows);
+    if(rows.length<GRID_PAGE) break;
+  }
+  return out;
+}
+const mapGridRows = grid => grid.map(r=>({cohort:r.cohort, type:r.type, rep:r.rep||"—", exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)}));
+const mapRevRows = tot => tot.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)}));
 async function refreshAll(config, nowKey, excluded=[]){
   const mt = mappedTypes(config);
   if(!mt.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
   const span = monthSpan(nowKey);
-  const [grid, totalMapped] = await Promise.all([
+  const [grid, totalMapped, mgrid, mrev] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
+    fetchMerchantGridPaged(span, excluded),
+    runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
   ]);
   return {
-    grid: grid.map(r=>({cohort:r.cohort, type:r.type, rep:r.rep||"—", exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)})),
-    totalMapped: totalMapped.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)})),
+    grid: mapGridRows(grid), totalMapped: mapRevRows(totalMapped),
+    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev),
     nowKey, refreshedAt: new Date().toISOString(),
   };
 }
@@ -319,13 +415,15 @@ async function refreshAll(config, nowKey, excluded=[]){
 async function gridWithExclusions(config, nowKey, excluded){
   const mt = mappedTypes(config);
   const span = monthSpan(nowKey);
-  const [grid, totalMapped] = await Promise.all([
+  const [grid, totalMapped, mgrid, mrev] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
+    fetchMerchantGridPaged(span, excluded),
+    runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
   ]);
   return {
-    grid: grid.map(r=>({cohort:r.cohort, type:r.type, rep:r.rep||"—", exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)})),
-    totalMapped: totalMapped.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)})),
+    grid: mapGridRows(grid), totalMapped: mapRevRows(totalMapped),
+    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev),
   };
 }
 const STORE = { config:"attainment_config", data:"attainment_data" };
@@ -340,29 +438,38 @@ async function loadConfig(){ try{ const d=await fridge.db.collection(STORE.confi
    row count so loadData can reject an incomplete read and fall back to a live
    query instead of rendering a grid with cohorts missing. */
 const CHUNK_BYTES = 48000;
-async function saveData(x){
-  const col = fridge.db.collection(STORE.data);
+/* Byte-chunk an array of grid rows into ~48 KB docs under a key prefix; returns
+   the number of chunks written. */
+async function chunkRows(col, rows, prefix){
   const chunks=[]; let cur=[], curBytes=0;
-  for(const row of x.grid){
+  for(const row of rows){
     const b = JSON.stringify(row).length;
     if(cur.length && curBytes+b>CHUNK_BYTES){ chunks.push(cur); cur=[]; curBytes=0; }
     cur.push(row); curBytes+=b;
   }
   if(cur.length) chunks.push(cur);
-  for(let i=0;i<chunks.length;i++) await col.create({value:chunks[i]}, "grid_"+i);
-  await col.create({value:{ v:5, chunks:chunks.length, rows:x.grid.length, totalMapped:x.totalMapped,
-    nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
+  for(let i=0;i<chunks.length;i++) await col.create({value:chunks[i]}, prefix+"_"+i);
+  return chunks.length;
+}
+async function saveData(x){
+  const col = fridge.db.collection(STORE.data);
+  const nGrid = await chunkRows(col, x.grid, "grid");
+  const nM = await chunkRows(col, x.mgrid||[], "mgrid");
+  await col.create({value:{ v:6, chunks:nGrid, mchunks:nM, rows:x.grid.length, mrows:(x.mgrid||[]).length,
+    totalMapped:x.totalMapped, mrev:x.mrev, nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
 }
 async function loadData(){
   try{
     const docs = await fridge.db.collection(STORE.data).list();
     const map = {}; for(const d of docs) map[d.key] = (d.value && d.value.value!==undefined) ? d.value.value : d.value;
-    const man = map["latest"]; if(!man || man.v!==5) return null;
+    const man = map["latest"]; if(!man || man.v!==6) return null;
     const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
+    const mgrid=[]; for(let i=0;i<(man.mchunks||0);i++){ const c=map["mgrid_"+i]; if(Array.isArray(c)) mgrid.push(...c); }
     // Reject a partial cache (a dropped/missing chunk) so we re-query instead of
     // silently showing a grid with cohorts missing — the bug this guards against.
     if(typeof man.rows==="number" && grid.length!==man.rows) return null;
-    return { grid, totalMapped:man.totalMapped, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
+    if(typeof man.mrows==="number" && mgrid.length!==man.mrows) return null;
+    return { grid, mgrid, totalMapped:man.totalMapped, mrev:man.mrev, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
   }catch{ return null; }
 }
 
@@ -494,7 +601,7 @@ async function applyExclusions(){
   setState({ phase:"busy", error:null, busyMsg: ex.length?`Recomputing without ${ex.length} merchant${ex.length>1?"s":""}…`:"Restoring all merchants…" });
   try{
     const filtered = await gridWithExclusions(state.config, state.data.nowKey, ex);
-    setState({ data:{...state.data, grid:filtered.grid, totalMapped:filtered.totalMapped}, phase:"ready", busyMsg:"" });
+    setState({ data:{...state.data, grid:filtered.grid, totalMapped:filtered.totalMapped, mgrid:filtered.mgrid, mrev:filtered.mrev}, phase:"ready", busyMsg:"" });
   }catch(e){
     setState({ error:String(e?.message||e), phase:"ready", busyMsg:"" });
   }
@@ -523,19 +630,24 @@ async function saveConfigAndRefresh(newCfg){
    is applied client-side afterward, so it is NOT part of the key. Cleared on
    refresh / exclusion change so stale merchant names never linger. */
 const cellCache = new Map();
-function cellKey(cohort, month){
-  const slugs=(state.types||[]).filter(s=>state.selected.has(s)).slice().sort().join(",");
+function cellKey(cohort, month, merchant){
+  const g = merchant ? "M" : (state.types||[]).filter(s=>state.selected.has(s)).slice().sort().join(",");
   const ex=[...state.excluded].sort().join(",");
-  return `${cohort}|${month}|${slugs}|${ex}`;
+  return `${merchant?"m":"p"}|${cohort}|${month}|${g}|${ex}`;
 }
-function prefetchCell(cohort, month){
-  const key=cellKey(cohort,month);
+function prefetchCell(cohort, month, merchant){
+  const key=cellKey(cohort,month,merchant);
   if(cellCache.has(key)) return cellCache.get(key);
-  const allSlugs=(state.types||[]).filter(s=>state.selected.has(s));
-  if(!allSlugs.length){ const p=Promise.resolve([]); cellCache.set(key,p); return p; }
-  const mt=mappedTypes(state.config).filter(t=>state.selected.has(t.slug));
-  const p=runSql(qCellDeals(mt,allSlugs,cohort,month,[...state.excluded]), ["name","rep","merchant","type","arr","actual","active","matched"])
-    .catch(err=>{ cellCache.delete(key); throw err; });
+  let p;
+  if(merchant){
+    p=runSql(qMerchantCellDeals(cohort,month,[...state.excluded]), ["merchant","rep","arr","actual","matched"]);
+  } else {
+    const allSlugs=(state.types||[]).filter(s=>state.selected.has(s));
+    if(!allSlugs.length){ const r=Promise.resolve([]); cellCache.set(key,r); return r; }
+    const mt=mappedTypes(state.config).filter(t=>state.selected.has(t.slug));
+    p=runSql(qCellDeals(mt,allSlugs,cohort,month,[...state.excluded]), ["name","rep","merchant","type","arr","actual","active","matched"]);
+  }
+  p=p.catch(err=>{ cellCache.delete(key); throw err; });
   cellCache.set(key,p);
   return p;
 }
@@ -574,14 +686,20 @@ function render(){
     state.types = gridTypes(state.data).sort((a,b)=>{
       const ca=cloudOrder[typeCloud(state.config,a)]??9, cb=cloudOrder[typeCloud(state.config,b)]??9;
       return ca-cb || typeName(state.config,a).localeCompare(typeName(state.config,b)); });
-    const model = computeModel(state.data, state.selected, state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0});
+    // "All products" uses the merchant-grain rollup (reconciles to Total Revenue,
+    // no product double-count); any narrower selection uses the product grid.
+    const merchantView = !!(state.data.mgrid && state.types.length && state.selected.size===state.types.length);
+    state._merchantView = merchantView;
+    const model = merchantView
+      ? computeModel({grid:state.data.mgrid, totalMapped:state.data.mrev, nowKey:state.data.nowKey}, new Set(["__all__"]), state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0})
+      : computeModel(state.data, state.selected, state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0});
     state._model = model;
     if(state.phase==="busy") main.appendChild(h("div",{style:{fontSize:"12px",color:T.orange,marginBottom:"16px",display:"flex",gap:"8px",alignItems:"center"}}, spinIcon(), state.busyMsg));
     main.appendChild(ScopeBar(model));
     main.appendChild(ControlsBar(model));
-    main.appendChild(StatStrip(model));
-    main.appendChild(h("div",{style:{marginTop:"24px"}}, CohortTable(model)));
-    main.appendChild(FooterNote());
+    main.appendChild(StatStrip(model, merchantView));
+    main.appendChild(h("div",{style:{marginTop:"24px"}}, CohortTable(model, merchantView)));
+    main.appendChild(FooterNote(merchantView));
   }
   app.appendChild(main);
   renderOverlay();
@@ -762,7 +880,7 @@ function MerchantPanel(){
   fill(); refreshFooter();
   return h("div",{style:wrapStyle}, head, input, list, footer);
 }
-function StatStrip(model){
+function StatStrip(model, merchantView){
   const cfg=state.config;
   const allSel=state.types||[];
   let activeCloud="custom", clouds=mappedCloudIds(cfg);
@@ -770,7 +888,7 @@ function StatStrip(model){
   else for(const cl of clouds){ const codes=cloudSlugs(cfg,cl.id); if(codes.length===state.selected.size && codes.every(c=>state.selected.has(c))){activeCloud=cl.id;break;} }
   const scopeLabel = activeCloud==="all"?"All products":activeCloud==="custom"?`${state.selected.size} of ${allSel.length} products`:(CLOUDS.find(c=>c.id===activeCloud)?.label||"");
   const grid=h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))",border:`1px solid ${T.divider}`,background:T.surface,marginTop:"24px"}});
-  grid.appendChild(Stat(`Overall attainment · ${scopeLabel}`, fmtPct(model.overall), `through ${keyToLabel(model.detailMonth)}`, true));
+  grid.appendChild(Stat(`Overall attainment · ${scopeLabel}`, fmtPct(model.overall), merchantView?`through ${keyToLabel(model.detailMonth)} · vs Total Revenue`:`through ${keyToLabel(model.detailMonth)}`, true));
   grid.appendChild(Stat("Closed Run-Rate in view", fmtMoney(model.totArr), `${model.cohorts.length?keyToLabel(model.cohorts[0]):""} – ${keyToLabel(model.last)}`));
   grid.appendChild(Stat("Deals in view", model.totDeals.toLocaleString(), "closed-won · NB + XSell"));
   grid.appendChild(Stat(`${keyToLabel(model.detailMonth)} attainment`, fmtPct(model.junPct), "last complete month"));
@@ -782,13 +900,15 @@ function Stat(label,value,sub,accent){
     h("div",{style:{marginTop:"8px",fontSize:"10px",fontWeight:600,letterSpacing:"0.08em",textTransform:"uppercase",color:T.muted}},label),
     sub?h("div",{style:{marginTop:"4px",fontSize:"11px",color:T.muted}},sub):null);
 }
-function FooterNote(){
+function FooterNote(merchantView){
   const stops=[["< 50%",heat(0.3)],["50–75%",heat(0.6)],["75–90%",heat(0.8)],["90–110%",heat(1.0)],["110–150%",heat(1.3)],["> 150%",heat(2)]];
   const legend=h("div",{style:{display:"flex",gap:"4px",alignItems:"center",flexWrap:"wrap"}},
     stops.map(([l,hh])=>h("span",{style:{fontSize:"10px",fontWeight:600,letterSpacing:"0.04em",padding:"4px 8px",background:hh.bg,color:hh.fg}}, l)));
+  const note = merchantView
+    ? "All products view — revenue is measured once per merchant from the report's Total Revenue column (not by summing overlapping product columns), so it reconciles exactly to total revenue. Each merchant's Total Revenue is credited to the cohort of their latest NB+XSell deal (latest deal wins); merchants with no deal are Orphaned. Attainment = attributed revenue ÷ (bookings ÷ 12). Select a single product or cloud for per-product attainment. Click any cell for the merchant list."
+    : "Closed Run-Rate is every NB+XSell closed-won deal in the cohort — matched or not, revenue or not. Attainment = attributed revenue ÷ (Run-Rate ÷ 12); unmatched Redo IDs and zero-revenue deals attain $0 and drag the cohort down. Revenue credits the most recent deal closed on or before each month, so re-signs never double count. The Total row sums every cohort plus Orphaned revenue; Orphaned revenue is the only revenue with no deal. Note: summing several products double-counts shared revenue — use All products for a reconciled total. Click any cell — or an Orphaned cell — for its deal / merchant list.";
   return h("div",{style:{marginTop:"24px",display:"flex",gap:"32px",flexWrap:"wrap",alignItems:"flex-start"}}, legend,
-    h("p",{style:{fontSize:"12px",color:T.muted,maxWidth:"640px",margin:0,lineHeight:"20px"}},
-      "Closed Run-Rate is every NB+XSell closed-won deal in the cohort — matched or not, revenue or not. Attainment = attributed revenue ÷ (Run-Rate ÷ 12); unmatched Redo IDs and zero-revenue deals attain $0 and drag the cohort down. Revenue credits the most recent deal closed on or before each month, so re-signs never double count. The Total row sums every cohort plus Orphaned revenue; Orphaned revenue is the only revenue with no deal. Click any cell — or an Orphaned cell — for its deal / merchant list."));
+    h("p",{style:{fontSize:"12px",color:T.muted,maxWidth:"640px",margin:0,lineHeight:"20px"}}, note));
 }
 
 /* Project a partial current month to a full-month run-rate: scale MTD by
@@ -799,7 +919,7 @@ function projFactor(){
   const dim=new Date(y,mo,0).getDate();
   return d>0?dim/d:1;
 }
-function CohortTable(model){
+function CohortTable(model, merchantView){
   const cal = state.view==="cal";
   const curMonth = state.data.nowKey;
   const factor = (cal && state.project) ? projFactor() : 1;
@@ -866,9 +986,9 @@ function CohortTable(model){
       let hoverT=null;
       const cell=h("button",{class:"cell", title:`${keyToLabel(r.c)} cohort · ${keyToLabel(m)}${projectCol(m)?" · projected":""}\nExpected ${fmtMoneyFull(e*rr)} · Actual ${fmtMoneyFull(a*rr)} · ${d} active`,
         style:{width:"100%",border:"none",cursor:"pointer",background:hh.bg,color:hh.fg,fontVariantNumeric:"tabular-nums",fontSize:"11px",fontWeight:600,padding:"6px",textAlign:"right"},
-        onMouseenter:()=>{ hoverT=setTimeout(()=>prefetchCell(r.c, m), 120); },
+        onMouseenter:()=>{ hoverT=setTimeout(()=>prefetchCell(r.c, m, merchantView), 120); },
         onMouseleave:()=>{ if(hoverT){ clearTimeout(hoverT); hoverT=null; } },
-        onClick:()=>setState({modal:{kind:"cell",cohort:r.c,month:m}})},
+        onClick:()=>setState({modal:{kind:merchantView?"mcell":"cell",cohort:r.c,month:m}})},
         state.metric==="pct"?(pct===Infinity?"∞":fmtPct(pct)):fmtMoney(a*rr));
       tr.appendChild(h("td",{style:{padding:"2px",borderBottom:`1px solid ${T.divider}`}}, cell));
     });
@@ -889,7 +1009,7 @@ function CohortTable(model){
     const rr=rrMult();
     const btn=h("button",{class:"cell", title:`Orphaned revenue · ${keyToLabel(c.key)}${projectCol(c.key)?" · projected":""}\n${fmtMoneyFull(v*rr)} — click for merchants`,
       style:{width:"100%",border:"none",cursor:"pointer",background:"transparent",color:T.blue,fontVariantNumeric:"tabular-nums",fontSize:"11px",fontWeight:600,padding:"6px",textAlign:"right"},
-      onClick:()=>setState({modal:{kind:"orphan",month:c.key}})}, fmtMoney(v*rr));
+      onClick:()=>setState({modal:{kind:merchantView?"morphan":"orphan",month:c.key}})}, fmtMoney(v*rr));
     unTr.appendChild(h("td",{style:{padding:"2px",...utTop,borderBottom:`1px solid ${T.divider}`}}, btn));
   });
   tbody.appendChild(unTr);
@@ -904,6 +1024,8 @@ function renderOverlay(){
   if(state.drawer && state.config) ov.appendChild(ConfigDrawer());
   if(state.modal?.kind==="cell" && state._model) ov.appendChild(CellModal(state.modal));
   if(state.modal?.kind==="orphan" && state._model) ov.appendChild(OrphanModal(state.modal));
+  if(state.modal?.kind==="mcell" && state._model) ov.appendChild(MerchantCellModal(state.modal));
+  if(state.modal?.kind==="morphan" && state._model) ov.appendChild(OrphanMerchantModal(state.modal));
 }
 const mtd={padding:"8px 16px",borderBottom:`1px solid ${T.divider}`,fontSize:"12px"};
 const mtdNum={...mtd,fontVariantNumeric:"tabular-nums",textAlign:"right",whiteSpace:"nowrap"};
@@ -1022,6 +1144,98 @@ function OrphanTable(rows, cfg){
   else tb.appendChild(h("tr",{style:{borderTop:`2px solid ${T.divider2}`}},
     h("td",{style:{...mtd,color:T.text,fontWeight:600}},`${rows.length} merchant${rows.length>1?"s":""}`),
     h("td",{style:mtd},""),
+    h("td",{style:{...mtdNum,color:T.blue,fontWeight:700}}, fmtMoneyFull(tot*rr))));
+  table.appendChild(tb);
+  return table;
+}
+/* ---- merchant-rollup drilldowns (the "All products" view) ---- */
+function MerchantCellModal(m){
+  const model=state._model;
+  const row=model.rows.find(r=>r.c===m.cohort);
+  const i=row?monthDiff(m.cohort,m.month):-1;
+  const e=row&&i>=0&&i<row.span?row.exp[i]:0, a=row&&i>=0&&i<row.span?row.act[i]:0, d=row&&i>=0&&i<row.span?row.dls[i]:0;
+  const pct=e>0?a/e:null; const rr=rrMult();
+  const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px",fontVariantNumeric:"tabular-nums"}},
+    `Cell: expected ${fmtMoneyFull(e*rr)} · actual ${fmtMoneyFull(a*rr)}${state.runRate?" (run-rate)":""} · `,
+    h("span",{style:{color:T.text,fontWeight:600}}, `${fmtPct(pct)} attained`), ` · ${d} deals`);
+  const body=h("div");
+  body.appendChild(h("div",{style:{padding:"16px 24px 0",fontSize:"12px",color:T.muted,lineHeight:"20px"}},
+    `Every merchant whose latest NB+XSell deal closed in this cohort, with total bookings vs their Total Revenue for ${keyToLabel(m.month)} (reconciles to the report's Total Revenue). Queried live from Snowflake.`));
+  const slot=h("div",{style:{padding:"48px",textAlign:"center",color:T.muted,fontSize:"13px",display:"flex",gap:"10px",justifyContent:"center",alignItems:"center"}}, spinIcon(), "Querying merchants…");
+  body.appendChild(slot);
+  const close=()=>setState({modal:null});
+  (async()=>{
+    try{
+      let rows=await prefetchCell(m.cohort, m.month, true);
+      if(state.repFilter!=="__all__") rows=rows.filter(r=>(r.rep||"—")===state.repFilter);
+      slot.replaceWith(MerchantCellTable(rows,m.month));
+    }catch(err){
+      const box=h("div",{style:{margin:"12px 24px",border:`1px solid ${T.red}`,background:"rgba(220,38,38,0.10)",padding:"10px 14px",fontSize:"12px",color:"#F5A399"}}, String(err?.message||err));
+      slot.replaceWith(box);
+    }
+  })();
+  return ModalShell("Merchant detail · live", `${keyToLabel(m.cohort)} cohort · ${keyToLabel(m.month)}`, subtitle, body, close);
+}
+function MerchantCellTable(rows, month){
+  const rr=rrMult();
+  const table=h("table",{style:{width:"100%",borderCollapse:"collapse",marginTop:"8px"}});
+  table.appendChild(h("thead",null,h("tr",null,
+    h("th",{style:thM()},"Merchant"),h("th",{style:thM()},"Rep"),
+    h("th",{style:thM(1)},"Bookings ARR"),h("th",{style:thM(1)}, state.runRate?"Expected / yr":"Expected / mo"),h("th",{style:thM(1)},`Total Rev (${keyToLabel(month)})${state.runRate?" ·/yr":""}`),h("th",{style:thM(1)},"Attainment"))));
+  const tb=h("tbody");
+  rows.forEach(r=>{
+    const arr=num(r.arr), actual=num(r.actual), expected=arr/12;
+    const p=expected>0?actual/expected:null; const hh=heat(p);
+    const unmatched=Number(r.matched)!==1;
+    tb.appendChild(h("tr",null,
+      h("td",{style:{...mtd,color:T.text}}, r.merchant, unmatched?h("span",{style:{fontSize:"9px",color:T.orange}}," · no Redo ID match"):null),
+      h("td",{style:mtd}, r.rep||"—"),
+      h("td",{style:mtdNum}, fmtMoneyFull(arr)),
+      h("td",{style:mtdNum}, fmtMoneyFull(expected*rr)),
+      h("td",{style:mtdNum}, fmtMoneyFull(actual*rr)),
+      h("td",{style:mtdNum}, p!=null?h("span",{style:{background:hh.bg,color:hh.fg,padding:"2px 8px",fontWeight:600}}, fmtPct(p)):"—")));
+  });
+  if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:6,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No merchants in this cohort for the current filters.")));
+  table.appendChild(tb);
+  return table;
+}
+function OrphanMerchantModal(m){
+  const model=state._model;
+  const total=(model.unatt[model.MIDX[m.month]]||0)*rrMult();
+  const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px",fontVariantNumeric:"tabular-nums"}},
+    `Total orphaned: `, h("span",{style:{color:T.blue,fontWeight:600}}, fmtMoneyFull(total)), state.runRate?" (run-rate)":"");
+  const body=h("div");
+  body.appendChild(h("div",{style:{padding:"16px 24px 0",fontSize:"12px",color:T.muted,lineHeight:"20px"}},
+    `Merchants with Total Revenue in ${keyToLabel(m.month)} but no closed-won NB+XSell deal on or before it — the revenue with no cohort behind it. Queried live from Snowflake.`));
+  const slot=h("div",{style:{padding:"48px",textAlign:"center",color:T.muted,fontSize:"13px",display:"flex",gap:"10px",justifyContent:"center",alignItems:"center"}}, spinIcon(), "Querying merchants…");
+  body.appendChild(slot);
+  const close=()=>setState({modal:null});
+  (async()=>{
+    try{
+      const rows=await runSql(qOrphanMerchants(m.month,[...state.excluded]), ["merchant","rev"]);
+      slot.replaceWith(OrphanMerchantTable(rows));
+    }catch(err){
+      const box=h("div",{style:{margin:"12px 24px",border:`1px solid ${T.red}`,background:"rgba(220,38,38,0.10)",padding:"10px 14px",fontSize:"12px",color:"#F5A399"}}, String(err?.message||err));
+      slot.replaceWith(box);
+    }
+  })();
+  return ModalShell("Orphaned revenue · live", `${keyToLabel(m.month)} · no deal behind it`, subtitle, body, close);
+}
+function OrphanMerchantTable(rows){
+  const rr=rrMult();
+  const table=h("table",{style:{width:"100%",borderCollapse:"collapse",marginTop:"8px"}});
+  table.appendChild(h("thead",null,h("tr",null,
+    h("th",{style:thM()},"Merchant"),h("th",{style:thM(1)}, state.runRate?"Total Rev ·/yr":"Total Revenue"))));
+  const tb=h("tbody");
+  const tot=rows.reduce((s,r)=>s+num(r.rev),0);
+  rows.forEach(r=>{
+    tb.appendChild(h("tr",null,
+      h("td",{style:{...mtd,color:T.text}}, r.merchant),
+      h("td",{style:mtdNum}, fmtMoneyFull(num(r.rev)*rr))));
+  });
+  if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:2,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No orphaned revenue for this month.")));
+  else tb.appendChild(h("tr",{style:{borderTop:`2px solid ${T.divider2}`}},
+    h("td",{style:{...mtd,color:T.text,fontWeight:600}},`${rows.length} merchant${rows.length>1?"s":""}`),
     h("td",{style:{...mtdNum,color:T.blue,fontWeight:700}}, fmtMoneyFull(tot*rr))));
   table.appendChild(tb);
   return table;
