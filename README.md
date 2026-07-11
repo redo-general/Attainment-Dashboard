@@ -57,6 +57,44 @@ drawer (a type can sum multiple columns), and persists in `fridge.db`. The last
 refresh is cached in `fridge.db` too, so the dashboard loads instantly and
 re-queries only on **Refresh** or a config change.
 
+## Data-integrity checks
+
+Every refresh (and every cached load) re-runs a set of reconciliation checks over
+the loaded data, surfaced as a **Data checks** chip next to *Advanced* (click for
+detail). They are living tests against real numbers, not fixtures:
+
+- **Cloud columns sum to Total Revenue** — the report's six `… Cloud Revenue`
+  columns must equal `Total Revenue` exactly. This is the identity the All-products
+  rollup relies on.
+- **All-products total row reconciles to Total Revenue** — attributed revenue never
+  exceeds the measured `Total Revenue` in any month, so the Orphaned row balances
+  every month and the Total row ties out.
+- **Products track their cloud** — for each cloud, the sum of the Configure-mapped
+  product columns is compared to that cloud's rollup column. An **over** means the
+  product columns overlap (double-count — the reason All products measures via
+  `Total Revenue`, not by summing products); an **under** means the cloud earns
+  revenue from columns not mapped to any deal type. These render as *review*
+  warnings, so taxonomy drift (a new revenue stream, a re-bucketed product) shows
+  up immediately. As of this writing Reverse Logistics products overlap ~4.6% and
+  Platform is ~39% under (Landed Cost sits in the report's Finance cloud, and
+  Platform includes unmapped streams like Catalog / Support AI).
+
+Checks that don't pass are also `console.warn`-ed for devtools.
+
+## Initial-load performance
+
+The initial data load is bounded by Snowflake **query compilation**, not the data
+scan. The report pre-aggregates to merchant×month in ~1s; the time goes to the
+services-layer compiler on the first (cold) query of a session (~12–17s), after
+which every query in that session compiles warm (~5s). Column width is *not* the
+driver — a one-column query over the 292-column report compiles as slowly as a
+21-column one — so trimming columns doesn't help.
+
+What does help: the grid (thousands of `(cohort, type, rep)` rows, capped at 500
+per query by the runtime) is paged, and the pages are now fetched in **parallel
+waves** (`fetchPagedParallel`) so their warm compilations overlap instead of
+running one-per-page in series. A 5-page grid costs about one wave instead of five.
+
 ## Files
 
 - **`index.html`** — the deployed app. Self-contained: theme, SQL generators,

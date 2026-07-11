@@ -318,6 +318,31 @@ SELECT COALESCE(mn.name, r.mid, '—') AS merchant, ROUND(r.rev) AS rev
 FROM mrev r LEFT JOIN dealset d ON d.mid=r.mid LEFT JOIN mnames mn ON mn.mid=r.mid
 WHERE d.mid IS NULL AND r.rev >= 1 ORDER BY r.rev DESC LIMIT 500`; };
 
+/* ---- Data-integrity reconciliation ----
+   One cheap all-time aggregate (no unpivot, no join) that returns the numbers the
+   in-app checks assert against: Total Revenue, each of the report's six Cloud
+   Revenue columns, and the sum of the config-mapped product columns per app cloud.
+   Total Revenue = the six cloud columns exactly; product columns inside a cloud
+   overlap, so p_* vs c_* surfaces that drift (see runChecks). */
+const REPORT_CLOUDS = [
+  { id:"relo", col:"Reverse Logistics Cloud Revenue", label:"Reverse Logistics" },
+  { id:"ship", col:"Shipping Cloud Revenue", label:"Shipping" },
+  { id:"conv", col:"Conversion Cloud Revenue", label:"Conversion" },
+  { id:"mktg", col:"Marketing Cloud Revenue", label:"Marketing" },
+  { id:"finance", col:"Finance Cloud Revenue", label:"Finance" },
+  { id:"plat", col:"Platform Cloud Revenue", label:"Platform" },
+];
+function qReconcile(config, excluded=[]){
+  const byCloud={};
+  for(const t of mappedTypes(config)){ const cl=typeCloud(config,t.slug); (byCloud[cl]=byCloud[cl]||[]).push(...t.cols); }
+  const prodSum = cols => (cols&&cols.length) ? cols.map(c=>`ZEROIFNULL(${qid(c)})`).join(" + ") : "0";
+  const cSel = REPORT_CLOUDS.map(rc=>`ROUND(SUM(ZEROIFNULL(${qid(rc.col)}))) AS c_${rc.id}`).join(", ");
+  const pSel = REPORT_CLOUDS.filter(rc=>rc.id!=="finance").map(rc=>`ROUND(SUM(${prodSum(byCloud[rc.id])})) AS p_${rc.id}`).join(", ");
+  return `SELECT ROUND(SUM(ZEROIFNULL(${qid("Total Revenue")}))) AS total, ${cSel}, ${pSel}
+    FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)}`;
+}
+const RECON_COLS = ["total","c_relo","c_ship","c_conv","c_mktg","c_finance","c_plat","p_relo","p_ship","p_conv","p_mktg","p_plat"];
+
 /* ---------------- data helpers ---------------- */
 function toObj(row, cols){
   if(Array.isArray(row)){ const o={}; cols.forEach((c,i)=>o[c]=row[i]); return o; }
@@ -370,26 +395,35 @@ async function discover(){
    only runs on an explicit Refresh. */
 const GRID_COLS = ["cohort","type","rep","exp_arr","act_arr","cnt_arr"];
 const GRID_PAGE = 500;
-async function fetchGridPaged(mt, span, excluded){
-  const out=[];
-  for(let p=0; p<200; p++){
-    const lo=p*GRID_PAGE+1, hi=(p+1)*GRID_PAGE;
-    const rows = await runSql(qGrid(mt,span,excluded,lo,hi), GRID_COLS, GRID_PAGE);
-    out.push(...rows);
-    if(rows.length<GRID_PAGE) break;
+/* Pages per parallel wave. The initial-load cost is Snowflake query COMPILATION
+   (~cold on the first query of a session, then a few seconds warm), not the data
+   scan (the report pre-aggregates in ~1s). The 500-row runtime cap forces the
+   grid — thousands of (cohort,type,rep) rows — to be paged, and paging the pages
+   SEQUENTIALLY paid that warm-compile cost once per page in series. Firing a wave
+   of pages concurrently overlaps their compilations, so a 5-page grid costs about
+   one wave instead of five. We fetch a wave, stop at the first short page (later
+   pages of that wave are disjoint empty tails and are discarded), else fetch the
+   next wave. */
+const PAGE_BATCH = 4;
+async function fetchPagedParallel(makeSql){
+  const out=[]; let base=0;
+  for(let guard=0; guard<64; guard++){
+    const wave=[];
+    for(let i=0;i<PAGE_BATCH;i++){ const p=base+i; wave.push(runSql(makeSql(p*GRID_PAGE+1,(p+1)*GRID_PAGE), GRID_COLS, GRID_PAGE)); }
+    const results = await Promise.all(wave);
+    let done=false;
+    for(const rows of results){ out.push(...rows); if(rows.length<GRID_PAGE){ done=true; break; } }
+    if(done) break;
+    base += PAGE_BATCH;
   }
   return out;
 }
+async function fetchGridPaged(mt, span, excluded){
+  return fetchPagedParallel((lo,hi)=>qGrid(mt,span,excluded,lo,hi));
+}
 /* Merchant-grain rollup grid (the "All products" view), paged like the product grid. */
 async function fetchMerchantGridPaged(span, excluded){
-  const out=[];
-  for(let p=0; p<200; p++){
-    const lo=p*GRID_PAGE+1, hi=(p+1)*GRID_PAGE;
-    const rows = await runSql(qMerchantGrid(span,excluded,lo,hi), GRID_COLS, GRID_PAGE);
-    out.push(...rows);
-    if(rows.length<GRID_PAGE) break;
-  }
-  return out;
+  return fetchPagedParallel((lo,hi)=>qMerchantGrid(span,excluded,lo,hi));
 }
 const mapGridRows = grid => grid.map(r=>({cohort:r.cohort, type:r.type, rep:r.rep||"—", exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)}));
 const mapRevRows = tot => tot.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)}));
@@ -397,15 +431,16 @@ async function refreshAll(config, nowKey, excluded=[]){
   const mt = mappedTypes(config);
   if(!mt.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
   const span = monthSpan(nowKey);
-  const [grid, totalMapped, mgrid, mrev] = await Promise.all([
+  const [grid, totalMapped, mgrid, mrev, recon] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
     fetchMerchantGridPaged(span, excluded),
     runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
+    runSql(qReconcile(config,excluded), RECON_COLS).then(r=>r[0]||null).catch(()=>null),
   ]);
   return {
     grid: mapGridRows(grid), totalMapped: mapRevRows(totalMapped),
-    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev),
+    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev), recon,
     nowKey, refreshedAt: new Date().toISOString(),
   };
 }
@@ -415,15 +450,16 @@ async function refreshAll(config, nowKey, excluded=[]){
 async function gridWithExclusions(config, nowKey, excluded){
   const mt = mappedTypes(config);
   const span = monthSpan(nowKey);
-  const [grid, totalMapped, mgrid, mrev] = await Promise.all([
+  const [grid, totalMapped, mgrid, mrev, recon] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
     fetchMerchantGridPaged(span, excluded),
     runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
+    runSql(qReconcile(config,excluded), RECON_COLS).then(r=>r[0]||null).catch(()=>null),
   ]);
   return {
     grid: mapGridRows(grid), totalMapped: mapRevRows(totalMapped),
-    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev),
+    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev), recon,
   };
 }
 const STORE = { config:"attainment_config", data:"attainment_data" };
@@ -455,21 +491,21 @@ async function saveData(x){
   const col = fridge.db.collection(STORE.data);
   const nGrid = await chunkRows(col, x.grid, "grid");
   const nM = await chunkRows(col, x.mgrid||[], "mgrid");
-  await col.create({value:{ v:6, chunks:nGrid, mchunks:nM, rows:x.grid.length, mrows:(x.mgrid||[]).length,
-    totalMapped:x.totalMapped, mrev:x.mrev, nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
+  await col.create({value:{ v:7, chunks:nGrid, mchunks:nM, rows:x.grid.length, mrows:(x.mgrid||[]).length,
+    totalMapped:x.totalMapped, mrev:x.mrev, recon:x.recon||null, nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
 }
 async function loadData(){
   try{
     const docs = await fridge.db.collection(STORE.data).list();
     const map = {}; for(const d of docs) map[d.key] = (d.value && d.value.value!==undefined) ? d.value.value : d.value;
-    const man = map["latest"]; if(!man || man.v!==6) return null;
+    const man = map["latest"]; if(!man || man.v!==7) return null;
     const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
     const mgrid=[]; for(let i=0;i<(man.mchunks||0);i++){ const c=map["mgrid_"+i]; if(Array.isArray(c)) mgrid.push(...c); }
     // Reject a partial cache (a dropped/missing chunk) so we re-query instead of
     // silently showing a grid with cohorts missing — the bug this guards against.
     if(typeof man.rows==="number" && grid.length!==man.rows) return null;
     if(typeof man.mrows==="number" && mgrid.length!==man.mrows) return null;
-    return { grid, mgrid, totalMapped:man.totalMapped, mrev:man.mrev, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
+    return { grid, mgrid, totalMapped:man.totalMapped, mrev:man.mrev, recon:man.recon||null, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
   }catch{ return null; }
 }
 
@@ -517,6 +553,63 @@ function computeModel(data, selected, config, opts={}){
   return { rows, maxSpan, unatt, MONTHS, MIDX, last, detailMonth, cohorts, reps, excludeM0, repFilter,
     overall: se>0?sa/se:null, junPct: jE>0?jA/jE:null, totArr, totDeals };
 }
+
+/* ---------------- data-integrity checks ----------------
+   Living tests over the loaded data (every refresh, and on cached loads):
+   (1) the report's six cloud columns sum to Total Revenue, (2) the All-products
+   total row reconciles to Total Revenue (attributed never exceeds the measured
+   total, so the orphaned row balances exactly), and (3) each app cloud's mapped
+   products track its cloud total — surfacing overlap (double-count) or unmapped
+   revenue drift. Rendered as a header chip + modal; non-passing checks also
+   console.warn so they show up in devtools. */
+function runChecks(data, config){
+  const out=[]; const push=(id,label,status,detail)=>out.push({id,label,status,detail});
+  try{
+    const r=data && data.recon;
+    if(r){
+      const total=num(r.total);
+      const sum6=REPORT_CLOUDS.reduce((a,rc)=>a+num(r["c_"+rc.id]),0);
+      const gap=Math.abs(sum6-total);
+      push("clouds_total","Cloud columns sum to Total Revenue",
+        gap<=Math.max(1,total*1e-7)?"pass":"fail",
+        gap<1 ? `Σ six cloud columns = Total Revenue (${fmtMoneyFull(total)}) exactly`
+              : `Σ six cloud columns ${fmtMoneyFull(sum6)} vs Total Revenue ${fmtMoneyFull(total)} — off by ${fmtMoneyFull(gap)}`);
+      for(const rc of REPORT_CLOUDS){
+        if(rc.id==="finance") continue;
+        const cloud=num(r["c_"+rc.id]), prod=num(r["p_"+rc.id]);
+        if(cloud<1 && prod<1) continue;
+        const diff=prod-cloud, pct=cloud>0?diff/cloud:(prod>0?1:0);
+        let status="pass";
+        if(cloud>=1 && prod<1) status="warn";
+        else if(Math.abs(pct)>0.01) status="warn";
+        const dir=diff>0?"over — products overlap (double-count)":"under — cloud has revenue not mapped to any product";
+        push("cloud_"+rc.id, `${rc.label} products track the cloud total`, status,
+          Math.abs(diff)<1 ? `Σ mapped products = ${rc.label} cloud (${fmtMoneyFull(cloud)}) exactly`
+          : `Σ mapped products ${fmtMoneyFull(prod)} vs ${rc.label} cloud ${fmtMoneyFull(cloud)} — ${fmtMoneyFull(Math.abs(diff))} ${dir} (${(pct*100).toFixed(1)}%)`);
+      }
+    }
+    if(data && data.mgrid && data.mrev && data.mrev[0]){
+      const attrBy={};
+      for(const s of data.mgrid){ (s.act||[]).forEach((v,i)=>{ const mk=addMonths(s.cohort,i); attrBy[mk]=(attrBy[mk]||0)+num(v); }); }
+      const mr=data.mrev[0]; let worstFrac=0, worst=0, worstMonth=null, n=0;
+      (mr.months||[]).forEach((mk,i)=>{ const rev=num(mr.rev[i]); if(rev<=0) return; n++;
+        const over=(attrBy[mk]||0)-rev; const frac=over/rev;
+        if(frac>worstFrac){ worstFrac=frac; worst=over; worstMonth=mk; } });
+      const bad=worstFrac>0.005 && worst>50;
+      push("rollup_total","All-products total row reconciles to Total Revenue",
+        bad?"fail":"pass",
+        bad ? `Attributed revenue exceeds Total Revenue by ${fmtMoneyFull(worst)} (${(worstFrac*100).toFixed(1)}%) in ${keyToLabel(worstMonth)} — double-count`
+            : `Attributed revenue never exceeds Total Revenue across ${n} months, so the orphaned row balances every month`);
+    }
+  }catch(e){ push("checks_error","Checks could not run","warn",String(e&&e.message||e)); }
+  return out;
+}
+const checksSummary = checks => ({
+  fail: checks.filter(c=>c.status==="fail").length,
+  warn: checks.filter(c=>c.status==="warn").length,
+  pass: checks.filter(c=>c.status==="pass").length,
+  total: checks.length,
+});
 
 /* ---------------- tiny DOM helper ---------------- */
 function h(tag, props, ...kids){
@@ -694,6 +787,8 @@ function render(){
       ? computeModel({grid:state.data.mgrid, totalMapped:state.data.mrev, nowKey:state.data.nowKey}, new Set(["__all__"]), state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0})
       : computeModel(state.data, state.selected, state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0});
     state._model = model;
+    state._checks = runChecks(state.data, state.config);
+    for(const c of state._checks){ if(c.status!=="pass") console.warn(`[data-check ${c.status}] ${c.label}: ${c.detail}`); }
     if(state.phase==="busy") main.appendChild(h("div",{style:{fontSize:"12px",color:T.orange,marginBottom:"16px",display:"flex",gap:"8px",alignItems:"center"}}, spinIcon(), state.busyMsg));
     main.appendChild(ScopeBar(model));
     main.appendChild(ControlsBar(model));
@@ -812,7 +907,7 @@ function ControlsBar(model){
     onClick:()=>setState({advancedOpen:!state.advancedOpen})},
     icon(IC.sliders,13), `Advanced${activeCount?` · ${activeCount} on`:""}`,
     h("span",{style:{fontSize:"9px",color:state.advancedOpen||activeCount?T.page:T.muted}}, state.advancedOpen?"▲":"▼"));
-  bar.appendChild(advBtn);
+  bar.appendChild(h("div",{style:{display:"flex",gap:"8px",alignItems:"center",flexWrap:"wrap"}}, advBtn, ChecksChip()));
   if(!state.advancedOpen) return bar;
 
   const wrap=h("div",{style:{display:"flex",gap:"8px",flexWrap:"wrap",alignItems:"center",marginTop:"12px",padding:"16px",border:`1px solid ${T.divider}`,background:T.surface,position:"relative"}});
@@ -846,6 +941,38 @@ function ControlsBar(model){
   }
   bar.appendChild(wrap);
   return bar;
+}
+/* Header chip summarizing the live data-integrity checks; opens the detail modal. */
+function ChecksChip(){
+  const checks=state._checks||[];
+  if(!checks.length) return h("span");
+  const s=checksSummary(checks);
+  const color=s.fail?T.red:s.warn?T.orange:T.green;
+  const label=s.fail?`Data checks · ${s.fail} failing`:s.warn?`Data checks · ${s.warn} to review`:`Data checks · all ${s.total} pass`;
+  const glyph=s.fail?"✕":s.warn?"!":"✓";
+  return h("button",{style:{...btnStyle(false),border:`1px solid ${color}`,color, gap:"8px"},
+    title:"Live reconciliation checks on the loaded data. Click for detail.", onClick:()=>setState({modal:{kind:"checks"}})},
+    h("span",{style:{fontWeight:700}},glyph), label);
+}
+function ChecksModal(){
+  const checks=state._checks||[];
+  const s=checksSummary(checks);
+  const close=()=>setState({modal:null});
+  const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px"}},
+    `${s.pass} passing · ${s.warn} to review · ${s.fail} failing — recomputed on every refresh from the loaded data.`);
+  const body=h("div",{style:{padding:"8px 0"}});
+  const clr=st=>st==="fail"?T.red:st==="warn"?T.orange:T.green;
+  const gl=st=>st==="fail"?"✕":st==="warn"?"!":"✓";
+  checks.forEach(c=>{
+    body.appendChild(h("div",{style:{display:"flex",gap:"14px",alignItems:"flex-start",padding:"14px 24px",borderBottom:`1px solid ${T.divider}`}},
+      h("span",{style:{flex:"0 0 auto",width:"20px",height:"20px",display:"inline-flex",alignItems:"center",justifyContent:"center",borderRadius:"50%",fontSize:"11px",fontWeight:700,color:T.page,background:clr(c.status)}}, gl(c.status)),
+      h("div",null,
+        h("div",{style:{fontSize:"13px",fontWeight:600,color:T.text}}, c.label),
+        h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"3px",lineHeight:"18px",fontVariantNumeric:"tabular-nums"}}, c.detail))));
+  });
+  body.appendChild(h("p",{style:{padding:"16px 24px",fontSize:"11px",color:T.muted,lineHeight:"17px",margin:0}},
+    "“Products track the cloud total” compares the sum of the deal-type→column mappings in Configure against the report's cloud rollup column. An over means the product columns share revenue (double-count — why All products uses Total Revenue instead); an under means the cloud earns revenue from columns not mapped to any deal type."));
+  return ModalShell("Data integrity · live", "Reconciliation checks", subtitle, body, close);
 }
 function MerchantPanel(){
   const wrapStyle={position:"absolute",top:"calc(100% + 8px)",left:0,zIndex:41,background:T.surface,border:`1px solid ${T.divider2}`,padding:"16px",width:"min(460px, 92vw)",display:"flex",flexDirection:"column"};
@@ -1026,6 +1153,7 @@ function renderOverlay(){
   if(state.modal?.kind==="orphan" && state._model) ov.appendChild(OrphanModal(state.modal));
   if(state.modal?.kind==="mcell" && state._model) ov.appendChild(MerchantCellModal(state.modal));
   if(state.modal?.kind==="morphan" && state._model) ov.appendChild(OrphanMerchantModal(state.modal));
+  if(state.modal?.kind==="checks") ov.appendChild(ChecksModal());
 }
 const mtd={padding:"8px 16px",borderBottom:`1px solid ${T.divider}`,fontSize:"12px"};
 const mtdNum={...mtd,fontVariantNumeric:"tabular-nums",textAlign:"right",whiteSpace:"nowrap"};
