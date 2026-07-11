@@ -145,10 +145,15 @@ const qRevenueColumns = () => `SELECT column_name AS col FROM KITCHEN.INFORMATIO
    Each (akey,type) group is the active deal from its close month until the next
    same-key deal closes (latest deal wins); a range-join to months expands only
    that window, avoiding a group-by-month cross product + ranking that timed out
-   on the runtime warehouse. NOTE: the Fridge Snowflake runtime rejects SQL that
-   contains comments, so no block or line comments may appear inside these SQL
-   template literals. */
-const qGrid = (types, span, excluded=[]) => `WITH
+   on the runtime warehouse. The Fridge Snowflake runtime hard-caps every query
+   at 500 rows, but the grid is one row per (cohort, type, rep) and runs into the
+   thousands — so this is fetched a page at a time via the QUALIFY ROW_NUMBER
+   window (lo..hi over a stable cohort/type/rep order); fetchGridPaged loops until
+   a short page comes back. Without paging, the runtime silently truncates to the
+   first 500 rows and every later cohort disappears. NOTE: the Fridge Snowflake
+   runtime rejects SQL that contains comments, so no block or line comments may
+   appear inside these SQL template literals. */
+const qGrid = (types, span, excluded=[], lo=1, hi=500) => `WITH
 months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
 lastm AS (SELECT MAX(m) AS m FROM months),
 report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
@@ -174,7 +179,9 @@ SELECT TO_CHAR(cohort,'YYYY-MM') AS cohort, type, rep,
   ARRAY_AGG(ROUND(expected)::int) WITHIN GROUP (ORDER BY m) AS exp_arr,
   ARRAY_AGG(ROUND(actual)::int)   WITHIN GROUP (ORDER BY m) AS act_arr,
   ARRAY_AGG(deals)                WITHIN GROUP (ORDER BY m) AS cnt_arr
-FROM per_month GROUP BY cohort, type, rep ORDER BY cohort, type, rep`;
+FROM per_month GROUP BY cohort, type, rep
+QUALIFY ROW_NUMBER() OVER (ORDER BY cohort, type, rep) BETWEEN ${lo} AND ${hi}
+ORDER BY cohort, type, rep`;
 const qTotalMapped = (types, span, excluded=[]) => `WITH ${baseCTEs(types,span,excluded)},
 ${revLongCTE(types, notInMids(excluded))},
 tm AS (SELECT type, m, SUM(rev) AS rev FROM rev GROUP BY 1,2)
@@ -269,12 +276,30 @@ async function discover(){
   ]);
   return { dealTypes: dealTypes.map(r=>({slug:r.slug,n:num(r.n),arr:num(r.arr)})), revCols: revCols.map(r=>r.col) };
 }
+/* The grid is one row per (cohort, type, rep) — thousands of rows — but the
+   Fridge Snowflake runtime hard-caps every query at 500 rows. Page through it
+   with the QUALIFY window in qGrid until a short page returns, so no cohort is
+   silently dropped past row 500. Pages run sequentially (each stop condition
+   depends on the previous page's length); the grid is cached afterward, so this
+   only runs on an explicit Refresh. */
+const GRID_COLS = ["cohort","type","rep","exp_arr","act_arr","cnt_arr"];
+const GRID_PAGE = 500;
+async function fetchGridPaged(mt, span, excluded){
+  const out=[];
+  for(let p=0; p<200; p++){
+    const lo=p*GRID_PAGE+1, hi=(p+1)*GRID_PAGE;
+    const rows = await runSql(qGrid(mt,span,excluded,lo,hi), GRID_COLS, GRID_PAGE);
+    out.push(...rows);
+    if(rows.length<GRID_PAGE) break;
+  }
+  return out;
+}
 async function refreshAll(config, nowKey, excluded=[]){
   const mt = mappedTypes(config);
   if(!mt.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
   const span = monthSpan(nowKey);
   const [grid, totalMapped] = await Promise.all([
-    runSql(qGrid(mt,span,excluded), ["cohort","type","rep","exp_arr","act_arr","cnt_arr"]),
+    fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
   ]);
   return {
@@ -290,7 +315,7 @@ async function gridWithExclusions(config, nowKey, excluded){
   const mt = mappedTypes(config);
   const span = monthSpan(nowKey);
   const [grid, totalMapped] = await Promise.all([
-    runSql(qGrid(mt,span,excluded), ["cohort","type","rep","exp_arr","act_arr","cnt_arr"]),
+    fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
   ]);
   return {
@@ -302,25 +327,37 @@ const STORE = { config:"attainment_config", data:"attainment_data" };
 async function saveConfig(c){ await fridge.db.collection(STORE.config).create({value:c},"v1"); }
 async function loadConfig(){ try{ const d=await fridge.db.collection(STORE.config).list(); const doc=d.find(x=>x.key==="v1")||d[0]; return doc?(doc.value?.value||doc.value):null; }catch{return null;} }
 /* The cohort grid is far larger than fridge.db's 64 KB/doc limit, so the cache
-   is chunked: a "latest" manifest doc plus grid_N docs of ~30 rows each. */
+   is chunked: a "latest" manifest doc plus grid_N docs. Chunks are sized by
+   BYTES (~48 KB, under the 64 KB doc cap) rather than a fixed row count, which
+   keeps the chunk count low — fridge.db list() only returns the 100 most-recent
+   docs, so a fixed 25-row chunking would silently start dropping chunks (and
+   whole cohorts) once the grid passed ~2.5k rows. The manifest records the total
+   row count so loadData can reject an incomplete read and fall back to a live
+   query instead of rendering a grid with cohorts missing. */
+const CHUNK_BYTES = 48000;
 async function saveData(x){
   const col = fridge.db.collection(STORE.data);
-  const CHUNK = 25;
-  const chunks = [];
-  for(let i=0;i<x.grid.length;i+=CHUNK) chunks.push(x.grid.slice(i,i+CHUNK));
+  const chunks=[]; let cur=[], curBytes=0;
+  for(const row of x.grid){
+    const b = JSON.stringify(row).length;
+    if(cur.length && curBytes+b>CHUNK_BYTES){ chunks.push(cur); cur=[]; curBytes=0; }
+    cur.push(row); curBytes+=b;
+  }
+  if(cur.length) chunks.push(cur);
   for(let i=0;i<chunks.length;i++) await col.create({value:chunks[i]}, "grid_"+i);
-  await col.create({value:{ v:4, chunks:chunks.length, totalMapped:x.totalMapped,
+  await col.create({value:{ v:5, chunks:chunks.length, rows:x.grid.length, totalMapped:x.totalMapped,
     nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
 }
 async function loadData(){
   try{
     const docs = await fridge.db.collection(STORE.data).list();
     const map = {}; for(const d of docs) map[d.key] = (d.value && d.value.value!==undefined) ? d.value.value : d.value;
-    const man = map["latest"]; if(!man || man.v!==4) return null;
+    const man = map["latest"]; if(!man || man.v!==5) return null;
     const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
-    if(grid.length!==0 || man.chunks===0)
-      return { grid, totalMapped:man.totalMapped, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
-    return null;
+    // Reject a partial cache (a dropped/missing chunk) so we re-query instead of
+    // silently showing a grid with cohorts missing — the bug this guards against.
+    if(typeof man.rows==="number" && grid.length!==man.rows) return null;
+    return { grid, totalMapped:man.totalMapped, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
   }catch{ return null; }
 }
 
