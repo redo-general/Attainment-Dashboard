@@ -68,10 +68,35 @@ re-queries only on **Refresh** or a config change.
 
 ## Deploying updates
 
-The Fridge site is a static-only deployment. To update the served app, edit
-`index.html` and republish through the Redo Unified MCP
-(`fridge_publish_site_files`, `html` param) or push to the site's hidden Git
-remote. Config and cached data survive redeploys (they live in `fridge.db`).
+The Fridge site is a **static-only** deployment. Key facts for redeploying:
+
+- **Site slug:** `deal-attainment` (owner: Ridge Durrant / `ridge@redo.com`).
+  Live URL `https://deal-attainment.fridge.redo.builders`.
+- **The only thing served is `index.html`.** Editing `src/` does nothing until
+  its output lands in `index.html`. Config and cached data survive redeploys —
+  they live in `fridge.db`, not in the bundle.
+
+**How to publish (the reliable path):** edit `index.html`, then call the Redo
+Unified MCP tool `fridge_publish_site_files` with `slug: "deal-attainment"`,
+`entrypoint: "index.html"`, and the full file contents in the `html` param. It
+writes the bundle as a commit to the site's hidden repo and queues a normal
+Git-backed deployment; a new version goes `active` within a few seconds.
+
+**Do not try to `git push` to the Fridge remote from a Claude Code / web
+session.** `git.fridge.redo.builders` resolves to a private Tailscale IP
+(`100.x` / `fd7a:…`) that is unreachable from the sandbox: the egress proxy
+denies it (502 on CONNECT) and a direct connection hits an SSRF guard (403,
+"Destination IP is in a private/reserved range"). Only the Redo Unified MCP
+server, which runs inside Redo's network, can reach it — hence
+`fridge_publish_site_files` is the deploy bridge, not `git`. (Pushing to the
+remote from a machine on the Redo tailnet still works; it's the sandbox that
+can't.)
+
+**Verify the deploy** with `fridge_get_site` (slug `deal-attainment`) — the
+returned `index.html` `sha256` / `byteSize` should match your local file
+(`sha256sum index.html`, `wc -c index.html`). A matching byte count is the
+quick check; a matching sha confirms it's byte-identical. `fridge_list_deployments`
+shows version history and lets you `fridge_rollback_site` if a publish is wrong.
 
 ## Why not a claude.ai artifact?
 
