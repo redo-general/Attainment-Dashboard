@@ -137,7 +137,13 @@ const qRevenueColumns = () => `SELECT column_name AS col FROM KITCHEN.INFORMATIO
    not). Every deal counts toward its cohort's expected/ARR; only matched deals
    of a mapped type earn attributed revenue, so unmatched / zero-revenue deals
    attain $0 and drag the cohort down. ARR is summed across all deals (same-month
-   deals coexist); revenue is credited once per merchant+type (latest cohort). */
+   deals coexist); revenue is credited once per merchant+type (latest cohort).
+   Each (akey,type) group is the active deal from its close month until the next
+   same-key deal closes (latest deal wins); a range-join to months expands only
+   that window, avoiding a group-by-month cross product + ranking that timed out
+   on the runtime warehouse. NOTE: the Fridge Snowflake runtime rejects SQL that
+   contains comments, so no block or line comments may appear inside these SQL
+   template literals. */
 const qGrid = (types, span) => `WITH
 months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
 lastm AS (SELECT MAX(m) AS m FROM months),
@@ -150,10 +156,6 @@ deals AS (
   WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'),
 grp AS (SELECT akey, mid, type, close_m, SUM(arr) AS arr, COUNT(DISTINCT DEAL_ID) AS ndeals FROM deals GROUP BY 1,2,3,4),
-/* Each (akey,type) group is the active deal from its close month until the next
-   same-key deal closes (latest deal wins). A range-join to months expands only
-   that window, avoiding a group×month cross product + ranking (which timed out
-   on the runtime warehouse). Non-overlapping consecutive windows == rn=1. */
 grp_win AS (SELECT mid, type, akey, close_m, arr, ndeals,
     COALESCE(DATEADD(month,-1, LEAD(close_m) OVER (PARTITION BY akey, type ORDER BY close_m)), (SELECT m FROM lastm)) AS end_m
   FROM grp),
