@@ -237,40 +237,56 @@ const qMerchants = () => `SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Mer
   ROUND(SUM(ZEROIFNULL(${qid("Total Revenue")}))) AS rev
   FROM ${REPORT} GROUP BY 1 ORDER BY 3 DESC NULLS LAST`;
 
-/* ---- Merchant-grain rollup (the "All products" view) ----
-   Summing per-product revenue columns double-counts, because the report's
-   product columns share underlying line items (Total Revenue = the 6 Cloud
-   columns, but the products inside a cloud overlap ~8%). To make "All products"
-   reconcile EXACTLY to Total Revenue, the rollup measures revenue once per
-   merchant via the single "Total Revenue" column and attributes it at merchant
-   grain: a merchant's cohort is the close month of their latest NB+XSell deal
-   (any product; latest deal wins), their bookings = that cohort event's summed
-   ARR, and their monthly Total Revenue is credited to that cohort. Merchants with
-   no deal on/before a month are Orphaned. The type dimension collapses to a
-   single '__all__' bucket so the same computeModel/table code renders it. */
-const qMerchantGrid = (span, excluded=[], lo=1, hi=500) => `WITH
+/* ---- "All products" view: per-product-line cohorts, revenue allocated from
+   Total Revenue ----
+   Attribution is at (merchant, product-type) grain, exactly like the product
+   grid: each product line's cohort is the close month of that merchant's latest
+   deal FOR THAT PRODUCT (latest same-product deal wins), so a merchant closing
+   Returns in Jan, FSR in Feb and Managed Returns in Mar keeps each product's
+   revenue in its own cohort — a later deal on a DIFFERENT product never pulls
+   earlier revenue forward. Bookings are per product line too (every deal counts
+   in its own cohort), which is the correct denominator (a multi-product merchant
+   contributes all their deals, not just the latest).
+   Revenue can't come from summing product columns (they overlap and double-count),
+   so instead each merchant's exact monthly Total Revenue is ALLOCATED across their
+   active product lines, weighted by each product's revenue column that month
+   (falling back to bookings weight when a merchant's mapped-product revenue is
+   zero). Every merchant's Total Revenue is therefore distributed in full and the
+   grid reconciles to Total Revenue exactly — no double-count, no pull-forward.
+   Merchants with no deal (or revenue before their first deal) land in Orphaned.
+   The type dimension collapses to a single '__all__' bucket so computeModel/table
+   render it unchanged. */
+const qMerchantGrid = (mappedTypes, span, excluded=[], lo=1, hi=500) => `WITH
 months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
 lastm AS (SELECT MAX(m) AS m FROM months),
 report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 deals AS (
-  SELECT TEAM_ID AS mid, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
+  SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
     DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
   FROM ${DEALS}
   WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' ${notInTeam(excluded)}),
-grp AS (SELECT akey, mid, close_m, SUM(arr) AS arr, COUNT(DISTINCT DEAL_ID) AS ndeals, MAX_BY(rep, arr) AS rep FROM deals GROUP BY 1,2,3),
-grp_win AS (SELECT mid, akey, close_m, arr, ndeals, rep,
-    COALESCE(DATEADD(month,-1, LEAD(close_m) OVER (PARTITION BY akey ORDER BY close_m)), (SELECT m FROM lastm)) AS end_m
+grp AS (SELECT akey, mid, type, close_m, SUM(arr) AS arr, COUNT(DISTINCT DEAL_ID) AS ndeals, MAX_BY(rep, arr) AS rep FROM deals GROUP BY 1,2,3,4),
+grp_win AS (SELECT mid, type, akey, close_m, arr, ndeals, rep,
+    COALESCE(DATEADD(month,-1, LEAD(close_m) OVER (PARTITION BY akey, type ORDER BY close_m)), (SELECT m FROM lastm)) AS end_m
   FROM grp),
-active AS (SELECT g.mid, g.close_m AS cohort, mo.m AS m, g.arr, g.ndeals, g.rep
+active AS (SELECT g.mid, g.type, g.close_m AS cohort, mo.m AS m, g.arr, g.ndeals, g.rep
   FROM grp_win g JOIN months mo ON mo.m >= g.close_m AND mo.m <= g.end_m),
+${revLongCTE(mappedTypes, `${notInMids(excluded)} AND ${qid("Merchant ID")} IN (SELECT mid FROM deals)`)},
 totrev AS (SELECT ${qid("Merchant ID")} AS mid, ${qid("Date")} AS m, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev
   FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)} AND ${qid("Merchant ID")} IN (SELECT mid FROM deals) GROUP BY 1,2),
-joined AS (SELECT a.cohort, a.rep, a.m, a.arr/12 AS expected, COALESCE(r.rev,0) AS actual, a.ndeals
-  FROM active a LEFT JOIN totrev r ON r.mid=a.mid AND r.m=a.m),
-per_month AS (SELECT cohort, rep, m, SUM(expected) AS expected, SUM(actual) AS actual, SUM(ndeals) AS deals
-  FROM joined GROUP BY 1,2,3)
+aw AS (SELECT a.mid, a.type, a.cohort, a.rep, a.m, a.arr, a.ndeals, COALESCE(r.rev,0) AS w_rev
+  FROM active a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type AND r.m=a.m),
+wsum AS (SELECT mid, m, SUM(w_rev) AS sw_rev, SUM(arr) AS sw_arr FROM aw GROUP BY 1,2),
+alloc AS (SELECT aw.cohort, aw.rep, aw.m, aw.arr, aw.ndeals,
+    CASE WHEN ws.sw_rev>0 THEN COALESCE(tr.rev,0)*aw.w_rev/ws.sw_rev
+         WHEN ws.sw_arr>0 THEN COALESCE(tr.rev,0)*aw.arr/ws.sw_arr
+         ELSE 0 END AS actual
+  FROM aw JOIN wsum ws ON ws.mid=aw.mid AND ws.m=aw.m
+          LEFT JOIN totrev tr ON tr.mid=aw.mid AND tr.m=aw.m),
+per_month AS (SELECT cohort, rep, m, SUM(arr)/12 AS expected, SUM(actual) AS actual, SUM(ndeals) AS deals
+  FROM alloc GROUP BY 1,2,3)
 SELECT TO_CHAR(cohort,'YYYY-MM') AS cohort, '__all__' AS type, rep,
   ARRAY_AGG(ROUND(expected)::int) WITHIN GROUP (ORDER BY m) AS exp_arr,
   ARRAY_AGG(ROUND(actual)::int)   WITHIN GROUP (ORDER BY m) AS act_arr,
@@ -285,27 +301,40 @@ const qTotalRevenue = (excluded=[]) => `SELECT '__all__' AS type,
   ARRAY_AGG(TO_CHAR(m,'YYYY-MM')) WITHIN GROUP (ORDER BY m) AS mon_arr
 FROM (SELECT ${qid("Date")}::date AS m, ROUND(SUM(ZEROIFNULL(${qid("Total Revenue")})))::int AS rev
   FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)} GROUP BY 1)`;
-/* Merchant-level detail for a rollup cohort cell: every merchant whose latest
-   deal on/before the month closed in this cohort, with bookings vs their Total
-   Revenue for the month. */
-const qMerchantCellDeals = (cohort, month, excluded=[]) => {
+/* Detail for an "All products" cohort cell: each (merchant, product-type) line
+   whose latest deal of that product on/before the month closed in this cohort,
+   with its bookings and the share of the merchant's Total Revenue allocated to it
+   that month (same weighting as qMerchantGrid). Mirrors the grid so the cell adds
+   up to the cohort's attributed revenue. */
+const qMerchantCellDeals = (mappedTypes, cohort, month, excluded=[]) => {
   const cd=`${cohort}-01`, md=`${month}-01`;
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' GROUP BY 1),
 mrev AS (SELECT ${qid("Merchant ID")} AS mid, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' ${notInMids(excluded)} GROUP BY 1),
-alld AS (SELECT TEAM_ID AS mid, COALESCE(NULLIF(AE_NAME,''),'—') AS rep, DEAL_AMOUNT AS arr, DEAL_ID,
+alld AS (SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, COALESCE(NULLIF(AE_NAME,''),'—') AS rep, DEAL_AMOUNT AS arr, DEAL_ID,
     DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN 1 ELSE 0 END AS matched,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
   FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' ${notInTeam(excluded)}),
-latest AS (SELECT akey, MAX(close_m) AS max_close FROM alld WHERE close_m <= DATE '${md}' GROUP BY 1),
-cohort_m AS (SELECT akey FROM latest WHERE max_close = DATE '${cd}'),
-booked AS (SELECT a.akey, MAX_BY(a.mid, a.arr) AS mid, MAX_BY(a.rep, a.arr) AS rep, SUM(a.arr) AS arr, MAX(a.matched) AS matched
-  FROM alld a WHERE a.close_m = DATE '${cd}' AND a.akey IN (SELECT akey FROM cohort_m) GROUP BY 1)
-SELECT COALESCE(mn.name, b.mid, '—') AS merchant, b.rep, ROUND(b.arr) AS arr, ROUND(COALESCE(mr.rev,0)) AS actual, b.matched
-FROM booked b LEFT JOIN mnames mn ON mn.mid=b.mid LEFT JOIN mrev mr ON mr.mid=b.mid
-ORDER BY b.arr DESC NULLS LAST LIMIT 500`; };
+gline AS (SELECT akey, type, close_m, MAX_BY(mid,arr) AS mid, MAX_BY(rep,arr) AS rep, SUM(arr) AS arr, MAX(matched) AS matched
+  FROM alld WHERE close_m <= DATE '${md}' GROUP BY 1,2,3),
+latest AS (SELECT akey, type, MAX(close_m) AS cohort FROM gline GROUP BY 1,2),
+lines AS (SELECT g.akey, g.mid, g.type, g.rep, g.matched, g.arr, l.cohort
+  FROM gline g JOIN latest l ON l.akey=g.akey AND l.type=g.type AND g.close_m=l.cohort),
+${revLongCTE(mappedTypes, `AND ${qid("Date")} = DATE '${md}' ${notInMids(excluded)}`)},
+aw AS (SELECT ln.mid, ln.type, ln.rep, ln.matched, ln.arr, ln.cohort, COALESCE(r.rev,0) AS w_rev
+  FROM lines ln LEFT JOIN rev r ON r.mid=ln.mid AND r.type=ln.type),
+wsum AS (SELECT mid, SUM(w_rev) AS sw_rev, SUM(arr) AS sw_arr FROM aw GROUP BY 1),
+alloc AS (SELECT aw.mid, aw.type, aw.rep, aw.matched, aw.arr, aw.cohort,
+    CASE WHEN ws.sw_rev>0 THEN COALESCE(mr.rev,0)*aw.w_rev/ws.sw_rev
+         WHEN ws.sw_arr>0 THEN COALESCE(mr.rev,0)*aw.arr/ws.sw_arr
+         ELSE 0 END AS actual
+  FROM aw JOIN wsum ws ON ws.mid=aw.mid LEFT JOIN mrev mr ON mr.mid=aw.mid)
+SELECT COALESCE(mn.name, a.mid, '—') AS merchant, a.type, a.rep, ROUND(a.arr) AS arr, ROUND(a.actual) AS actual, a.matched
+FROM alloc a LEFT JOIN mnames mn ON mn.mid=a.mid
+WHERE a.cohort = DATE '${cd}'
+ORDER BY a.arr DESC NULLS LAST LIMIT 500`; };
 /* Orphaned (rollup): merchants with Total Revenue in the month but no closed-won
    NB+XSell deal on/before it — the revenue with no cohort behind it. */
 const qOrphanMerchants = (month, excluded=[]) => {
@@ -421,9 +450,9 @@ async function fetchPagedParallel(makeSql){
 async function fetchGridPaged(mt, span, excluded){
   return fetchPagedParallel((lo,hi)=>qGrid(mt,span,excluded,lo,hi));
 }
-/* Merchant-grain rollup grid (the "All products" view), paged like the product grid. */
-async function fetchMerchantGridPaged(span, excluded){
-  return fetchPagedParallel((lo,hi)=>qMerchantGrid(span,excluded,lo,hi));
+/* "All products" allocation grid, paged like the product grid. */
+async function fetchMerchantGridPaged(mt, span, excluded){
+  return fetchPagedParallel((lo,hi)=>qMerchantGrid(mt,span,excluded,lo,hi));
 }
 const mapGridRows = grid => grid.map(r=>({cohort:r.cohort, type:r.type, rep:r.rep||"—", exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)}));
 const mapRevRows = tot => tot.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)}));
@@ -434,7 +463,7 @@ async function refreshAll(config, nowKey, excluded=[]){
   const [grid, totalMapped, mgrid, mrev, recon] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
-    fetchMerchantGridPaged(span, excluded),
+    fetchMerchantGridPaged(mt, span, excluded),
     runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
     runSql(qReconcile(config,excluded), RECON_COLS).then(r=>r[0]||null).catch(()=>null),
   ]);
@@ -453,7 +482,7 @@ async function gridWithExclusions(config, nowKey, excluded){
   const [grid, totalMapped, mgrid, mrev, recon] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
-    fetchMerchantGridPaged(span, excluded),
+    fetchMerchantGridPaged(mt, span, excluded),
     runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
     runSql(qReconcile(config,excluded), RECON_COLS).then(r=>r[0]||null).catch(()=>null),
   ]);
@@ -733,7 +762,7 @@ function prefetchCell(cohort, month, merchant){
   if(cellCache.has(key)) return cellCache.get(key);
   let p;
   if(merchant){
-    p=runSql(qMerchantCellDeals(cohort,month,[...state.excluded]), ["merchant","rep","arr","actual","matched"]);
+    p=runSql(qMerchantCellDeals(mappedTypes(state.config),cohort,month,[...state.excluded]), ["merchant","type","rep","arr","actual","matched"]);
   } else {
     const allSlugs=(state.types||[]).filter(s=>state.selected.has(s));
     if(!allSlugs.length){ const r=Promise.resolve([]); cellCache.set(key,r); return r; }
@@ -1032,7 +1061,7 @@ function FooterNote(merchantView){
   const legend=h("div",{style:{display:"flex",gap:"4px",alignItems:"center",flexWrap:"wrap"}},
     stops.map(([l,hh])=>h("span",{style:{fontSize:"10px",fontWeight:600,letterSpacing:"0.04em",padding:"4px 8px",background:hh.bg,color:hh.fg}}, l)));
   const note = merchantView
-    ? "All products view — revenue is measured once per merchant from the report's Total Revenue column (not by summing overlapping product columns), so it reconciles exactly to total revenue. Each merchant's Total Revenue is credited to the cohort of their latest NB+XSell deal (latest deal wins); merchants with no deal are Orphaned. Attainment = attributed revenue ÷ (bookings ÷ 12). Select a single product or cloud for per-product attainment. Click any cell for the merchant list."
+    ? "All products view — each merchant's exact Total Revenue is allocated across their product lines (weighted by each product's revenue), and every product's share stays in the cohort of that product's own latest deal. A later deal on a different product never pulls earlier revenue forward, and it reconciles exactly to Total Revenue (no double-count). Bookings count every deal in its own cohort; revenue with no deal behind it (or before a merchant's first deal) is Orphaned. Attainment = allocated revenue ÷ (bookings ÷ 12); the Total row is the month's Total Revenue ÷ all bookings closed to date. Click any cell for the per-product breakdown."
     : "Closed Run-Rate is every NB+XSell closed-won deal in the cohort — matched or not, revenue or not. Attainment = attributed revenue ÷ (Run-Rate ÷ 12); unmatched Redo IDs and zero-revenue deals attain $0 and drag the cohort down. Revenue credits the most recent deal closed on or before each month, so re-signs never double count. The Total row sums every cohort plus Orphaned revenue; Orphaned revenue is the only revenue with no deal. Note: summing several products double-counts shared revenue — use All products for a reconciled total. Click any cell — or an Orphaned cell — for its deal / merchant list.";
   return h("div",{style:{marginTop:"24px",display:"flex",gap:"32px",flexWrap:"wrap",alignItems:"flex-start"}}, legend,
     h("p",{style:{fontSize:"12px",color:T.muted,maxWidth:"640px",margin:0,lineHeight:"20px"}}, note));
@@ -1288,7 +1317,7 @@ function MerchantCellModal(m){
     h("span",{style:{color:T.text,fontWeight:600}}, `${fmtPct(pct)} attained`), ` · ${d} deals`);
   const body=h("div");
   body.appendChild(h("div",{style:{padding:"16px 24px 0",fontSize:"12px",color:T.muted,lineHeight:"20px"}},
-    `Every merchant whose latest NB+XSell deal closed in this cohort, with total bookings vs their Total Revenue for ${keyToLabel(m.month)} (reconciles to the report's Total Revenue). Queried live from Snowflake.`));
+    `Each merchant + product whose latest deal of that product closed in this cohort, with its bookings and the share of the merchant's Total Revenue allocated to it for ${keyToLabel(m.month)} (weighted by product revenue; sums to the cohort's attributed revenue). Queried live from Snowflake.`));
   const slot=h("div",{style:{padding:"48px",textAlign:"center",color:T.muted,fontSize:"13px",display:"flex",gap:"10px",justifyContent:"center",alignItems:"center"}}, spinIcon(), "Querying merchants…");
   body.appendChild(slot);
   const close=()=>setState({modal:null});
@@ -1307,9 +1336,10 @@ function MerchantCellModal(m){
 function MerchantCellTable(rows, month){
   const rr=rrMult();
   const table=h("table",{style:{width:"100%",borderCollapse:"collapse",marginTop:"8px"}});
+  const cfg=state.config;
   table.appendChild(h("thead",null,h("tr",null,
-    h("th",{style:thM()},"Merchant"),h("th",{style:thM()},"Rep"),
-    h("th",{style:thM(1)},"Bookings ARR"),h("th",{style:thM(1)}, state.runRate?"Expected / yr":"Expected / mo"),h("th",{style:thM(1)},`Total Rev (${keyToLabel(month)})${state.runRate?" ·/yr":""}`),h("th",{style:thM(1)},"Attainment"))));
+    h("th",{style:thM()},"Merchant"),h("th",{style:thM()},"Product"),h("th",{style:thM()},"Rep"),
+    h("th",{style:thM(1)},"Bookings ARR"),h("th",{style:thM(1)}, state.runRate?"Expected / yr":"Expected / mo"),h("th",{style:thM(1)},`Allocated rev (${keyToLabel(month)})${state.runRate?" ·/yr":""}`),h("th",{style:thM(1)},"Attainment"))));
   const tb=h("tbody");
   rows.forEach(r=>{
     const arr=num(r.arr), actual=num(r.actual), expected=arr/12;
@@ -1317,13 +1347,14 @@ function MerchantCellTable(rows, month){
     const unmatched=Number(r.matched)!==1;
     tb.appendChild(h("tr",null,
       h("td",{style:{...mtd,color:T.text}}, r.merchant, unmatched?h("span",{style:{fontSize:"9px",color:T.orange}}," · no Redo ID match"):null),
+      h("td",{style:mtd}, typeName(cfg,r.type)),
       h("td",{style:mtd}, r.rep||"—"),
       h("td",{style:mtdNum}, fmtMoneyFull(arr)),
       h("td",{style:mtdNum}, fmtMoneyFull(expected*rr)),
       h("td",{style:mtdNum}, fmtMoneyFull(actual*rr)),
       h("td",{style:mtdNum}, p!=null?h("span",{style:{background:hh.bg,color:hh.fg,padding:"2px 8px",fontWeight:600}}, fmtPct(p)):"—")));
   });
-  if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:6,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No merchants in this cohort for the current filters.")));
+  if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:7,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No merchants in this cohort for the current filters.")));
   table.appendChild(tb);
   return table;
 }
