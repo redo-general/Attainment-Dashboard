@@ -133,20 +133,35 @@ const qDealTypes = () => `SELECT PRODUCT AS slug, COUNT(*) AS n, ROUND(SUM(DEAL_
   GROUP BY 1 ORDER BY n DESC`;
 const qRevenueColumns = () => `SELECT column_name AS col FROM KITCHEN.INFORMATION_SCHEMA.COLUMNS
   WHERE table_schema='PANTRY' AND table_name='INGR_MONTHLY_REPORT_V2' AND column_name ILIKE '%Revenue%' ORDER BY ordinal_position`;
-const qGrid = (types, span) => `WITH ${baseCTEs(types,span)},
-deal_months AS (SELECT d.mid, d.type, d.arr, d.close_m, d.DEAL_ID, mo.m,
-    ROW_NUMBER() OVER (PARTITION BY d.mid, d.type, mo.m ORDER BY d.close_m DESC, d.DEAL_ID DESC) AS rn
-  FROM deals d JOIN months mo ON mo.m >= d.close_m),
-attributed AS (SELECT mid, type, m, arr, close_m FROM deal_months WHERE rn = 1),
+/* Cohort grid over ALL NB+XSell closed-won deals (matched or not, mapped type or
+   not). Every deal counts toward its cohort's expected/ARR; only matched deals
+   of a mapped type earn attributed revenue, so unmatched / zero-revenue deals
+   attain $0 and drag the cohort down. ARR is summed across all deals (same-month
+   deals coexist); revenue is credited once per merchant+type (latest cohort). */
+const qGrid = (types, span) => `WITH
+months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
+report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
+deals AS (
+  SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr, DEAL_ID,
+    DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
+    CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
+  FROM ${DEALS}
+  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+    AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'),
+grp AS (SELECT akey, mid, type, close_m, SUM(arr) AS arr, COUNT(DISTINCT DEAL_ID) AS ndeals FROM deals GROUP BY 1,2,3,4),
+grp_months AS (SELECT g.mid, g.type, g.close_m, g.arr, g.ndeals, mo.m,
+    ROW_NUMBER() OVER (PARTITION BY g.akey, g.type, mo.m ORDER BY g.close_m DESC) AS rn
+  FROM grp g JOIN months mo ON mo.m >= g.close_m),
+active AS (SELECT mid, type, m, close_m AS cohort, arr, ndeals FROM grp_months WHERE rn = 1),
 ${revLongCTE(types)},
-joined AS (SELECT a.close_m AS cohort, a.type, a.m, a.arr/12 AS expected, COALESCE(r.rev,0) AS actual, a.mid
-  FROM attributed a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type AND r.m=a.m),
-per_month AS (SELECT cohort, type, m, SUM(expected) AS expected, SUM(actual) AS actual, COUNT(DISTINCT mid) AS merchants
+joined AS (SELECT a.cohort, a.type, a.m, a.arr/12 AS expected, COALESCE(r.rev,0) AS actual, a.ndeals
+  FROM active a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type AND r.m=a.m),
+per_month AS (SELECT cohort, type, m, SUM(expected) AS expected, SUM(actual) AS actual, SUM(ndeals) AS deals
   FROM joined GROUP BY 1,2,3)
 SELECT TO_CHAR(cohort,'YYYY-MM') AS cohort, type,
   ARRAY_AGG(ROUND(expected)::int) WITHIN GROUP (ORDER BY m) AS exp_arr,
   ARRAY_AGG(ROUND(actual)::int)   WITHIN GROUP (ORDER BY m) AS act_arr,
-  ARRAY_AGG(merchants)            WITHIN GROUP (ORDER BY m) AS cnt_arr
+  ARRAY_AGG(deals)                WITHIN GROUP (ORDER BY m) AS cnt_arr
 FROM per_month GROUP BY cohort, type ORDER BY cohort, type`;
 const qTotalMapped = (types, span) => `WITH ${baseCTEs(types,span)},
 ${revLongCTE(types)},
@@ -154,43 +169,29 @@ tm AS (SELECT type, m, SUM(rev) AS rev FROM rev GROUP BY 1,2)
 SELECT tm.type, ARRAY_AGG(ROUND(ZEROIFNULL(tm.rev))::int) WITHIN GROUP (ORDER BY tm.m) AS rev_arr,
   ARRAY_AGG(TO_CHAR(tm.m,'YYYY-MM')) WITHIN GROUP (ORDER BY tm.m) AS mon_arr
 FROM tm GROUP BY tm.type ORDER BY tm.type`;
-/* Unmeasured bucket: every NB+XSell closed-won deal NOT in the matched grid —
-   i.e. unmatched Redo ID OR a product type with no mapped revenue column. Grid
-   ARR + this bucket reconciles to HubSpot closed-won for the cohort. */
-const qNoMatchAgg = types => { const slugs=types.map(t=>sq(t.slug)).join(",");
-  return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
-SELECT TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date,'YYYY-MM') AS cohort,
-  COALESCE(NULLIF(PRODUCT,''),'(unmapped)') AS type, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr
-FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
-  AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
-  AND NOT (TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) AND PRODUCT IN (${slugs}))
-  GROUP BY 1,2 ORDER BY 1,2`; };
-const qNoMatchDeals = (types, limit=120) => { const slugs=types.map(t=>sq(t.slug)).join(",");
-  return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT})
-SELECT DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, COALESCE(TEAM_ID,'—') AS redo_id,
-  COALESCE(NULLIF(PRODUCT,''),'(unmapped)') AS type, ROUND(DEAL_AMOUNT) AS arr,
-  TO_CHAR(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date,'YYYY-MM') AS cohort
-FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
-  AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
-  AND NOT (TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) AND PRODUCT IN (${slugs}))
-ORDER BY DEAL_AMOUNT DESC NULLS LAST LIMIT ${limit}`; };
-const qCellDeals = (types, cohort, month) => { const slugs=types.map(t=>sq(t.slug)).join(",");
+/* Deal-level detail for a cohort cell: every deal in the cohort of the types in
+   view (matched OR not). Superseded re-signs (a later deal for the same merchant
+   + type) show inactive; unmatched deals (no Redo ID in the report) show $0. */
+const qCellDeals = (mappedTypes, allSlugs, cohort, month) => {
+  const slugs = allSlugs.map(s=>sq(s)).join(",");
   const cd=`${cohort}-01`, md=`${month}-01`;
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} GROUP BY 1),
-cohort_deals AS (SELECT DEAL_ID, DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, TEAM_ID AS mid, PRODUCT AS type, DEAL_AMOUNT AS arr
-  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PIPELINE_ID IN ${PIPES}
-    AND PRODUCT IN (${slugs}) AND TEAM_ID IN (SELECT mid FROM report_mids)
-    AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date = DATE '${cd}'),
-latest AS (SELECT TEAM_ID AS mid, PRODUCT AS type, MAX(DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date) AS max_close
-  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL AND PIPELINE_ID IN ${PIPES} AND PRODUCT IN (${slugs})
-    AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date <= DATE '${md}' GROUP BY 1,2),
-${revLongCTE(types, `AND ${qid("Date")} = DATE '${md}'`)},
-alloc AS (SELECT cd.*, l.max_close, SUM(cd.arr) OVER (PARTITION BY cd.mid, cd.type) AS grp_arr
-  FROM cohort_deals cd JOIN latest l ON l.mid=cd.mid AND l.type=cd.type)
-SELECT a.name, a.rep, COALESCE(mn.name, a.mid) AS merchant, a.type, ROUND(a.arr) AS arr,
+alld AS (SELECT DEAL_ID, DEAL_NAME AS name, COALESCE(AE_NAME,'—') AS rep, TEAM_ID AS mid,
+    COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr,
+    DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
+    CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN 1 ELSE 0 END AS matched,
+    CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
+  FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+    AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'),
+cohort_deals AS (SELECT * FROM alld WHERE close_m = DATE '${cd}' AND type IN (${slugs})),
+latest AS (SELECT akey, type, MAX(close_m) AS max_close FROM alld WHERE close_m <= DATE '${md}' GROUP BY 1,2),
+${revLongCTE(mappedTypes, `AND ${qid("Date")} = DATE '${md}'`)},
+alloc AS (SELECT cd.*, l.max_close, SUM(cd.arr) OVER (PARTITION BY cd.akey, cd.type) AS grp_arr
+  FROM cohort_deals cd JOIN latest l ON l.akey=cd.akey AND l.type=cd.type)
+SELECT a.name, a.rep, COALESCE(mn.name, a.mid, '—') AS merchant, a.type, ROUND(a.arr) AS arr,
   CASE WHEN a.max_close = DATE '${cd}' THEN ROUND(COALESCE(r.rev,0) * a.arr / NULLIF(a.grp_arr,0)) END AS actual,
-  CASE WHEN a.max_close = DATE '${cd}' THEN 1 ELSE 0 END AS active
+  CASE WHEN a.max_close = DATE '${cd}' THEN 1 ELSE 0 END AS active, a.matched
 FROM alloc a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type LEFT JOIN mnames mn ON mn.mid=a.mid
 ORDER BY a.arr DESC NULLS LAST LIMIT 500`; };
 
@@ -222,12 +223,14 @@ function mergeDiscovery(config, disc){
   }
   return cfg;
 }
-const activeTypes = config => config.order.filter(s=>config.types[s].on && config.types[s].cols.length).map(s=>({slug:s,cols:config.types[s].cols}));
-const cloudSlugs = (config, id) => config.order.filter(s=>(config.types[s].cloud||"other")===id && config.types[s].on && config.types[s].cols.length);
-const mappedCloudIds = config => { const ids=new Set();
-  for(const s of config.order){ const t=config.types[s]; if(t.on&&t.cols.length) ids.add(t.cloud||"other"); }
-  return CLOUDS.filter(c=>ids.has(c.id)); };
-const selList = (config, selected) => config.order.filter(s=>config.types[s].on && config.types[s].cols.length && selected.has(s)).map(s=>({slug:s,cols:config.types[s].cols}));
+/* Mapped types = enabled types with a revenue column (drive attributed revenue). */
+const mappedTypes = config => config.order.filter(s=>config.types[s].on && config.types[s].cols && config.types[s].cols.length).map(s=>({slug:s,cols:config.types[s].cols}));
+/* The type universe is every product type present in the grid (mapped or not). */
+const gridTypes = data => (data && data.grid) ? [...new Set(data.grid.map(g=>g.type))] : [];
+const typeCloud = (config,s)=> (config && config.types[s] && config.types[s].cloud) || "other";
+const typeName = (config,s)=> (config && config.types[s] && config.types[s].name) || (s==="(none)" ? "(no product)" : prettify(s));
+const cloudSlugs = (config, id) => (state.types||[]).filter(s=>typeCloud(config,s)===id);
+const mappedCloudIds = config => CLOUDS.filter(cl=>(state.types||[]).some(s=>typeCloud(config,s)===cl.id));
 
 async function discover(){
   const [dealTypes, revCols] = await Promise.all([
@@ -237,20 +240,16 @@ async function discover(){
   return { dealTypes: dealTypes.map(r=>({slug:r.slug,n:num(r.n),arr:num(r.arr)})), revCols: revCols.map(r=>r.col) };
 }
 async function refreshAll(config, nowKey){
-  const types = activeTypes(config);
-  if(!types.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
+  const mt = mappedTypes(config);
+  if(!mt.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
   const span = monthSpan(nowKey);
-  const [grid, totalMapped, noMatchAgg, noMatchDeals] = await Promise.all([
-    runSql(qGrid(types,span), ["cohort","type","exp_arr","act_arr","cnt_arr"]),
-    runSql(qTotalMapped(types,span), ["type","rev_arr","mon_arr"]),
-    runSql(qNoMatchAgg(types), ["cohort","type","n","arr"]),
-    runSql(qNoMatchDeals(types), ["name","rep","redo_id","type","arr","cohort"]),
+  const [grid, totalMapped] = await Promise.all([
+    runSql(qGrid(mt,span), ["cohort","type","exp_arr","act_arr","cnt_arr"]),
+    runSql(qTotalMapped(mt,span), ["type","rev_arr","mon_arr"]),
   ]);
   return {
     grid: grid.map(r=>({cohort:r.cohort, type:r.type, exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)})),
     totalMapped: totalMapped.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)})),
-    noMatchAgg: noMatchAgg.map(r=>({cohort:r.cohort, type:r.type, n:num(r.n), arr:num(r.arr)})),
-    noMatchDeals: noMatchDeals.map(r=>({name:r.name, rep:r.rep, redoId:r.redo_id, type:r.type, arr:num(r.arr), cohort:r.cohort})),
     nowKey, refreshedAt: new Date().toISOString(),
   };
 }
@@ -265,21 +264,18 @@ async function saveData(x){
   const chunks = [];
   for(let i=0;i<x.grid.length;i+=CHUNK) chunks.push(x.grid.slice(i,i+CHUNK));
   for(let i=0;i<chunks.length;i++) await col.create({value:chunks[i]}, "grid_"+i);
-  await col.create({value:{ v:2, chunks:chunks.length, totalMapped:x.totalMapped,
-    noMatchAgg:x.noMatchAgg, noMatchDeals:x.noMatchDeals, nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
+  await col.create({value:{ v:3, chunks:chunks.length, totalMapped:x.totalMapped,
+    nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
 }
 async function loadData(){
   try{
     const docs = await fridge.db.collection(STORE.data).list();
     const map = {}; for(const d of docs) map[d.key] = (d.value && d.value.value!==undefined) ? d.value.value : d.value;
-    const man = map["latest"]; if(!man) return null;
-    if(man.v===2){
-      const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
-      if(grid.length!==0 || man.chunks===0)
-        return { grid, totalMapped:man.totalMapped, noMatchAgg:man.noMatchAgg, noMatchDeals:man.noMatchDeals, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
-      return null;
-    }
-    return man.grid ? man : null;
+    const man = map["latest"]; if(!man || man.v!==3) return null;
+    const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
+    if(grid.length!==0 || man.chunks===0)
+      return { grid, totalMapped:man.totalMapped, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
+    return null;
   }catch{ return null; }
 }
 
@@ -317,14 +313,11 @@ function computeModel(data, selected, config){
   for(const t of data.totalMapped){ const arr=Array(MONTHS.length).fill(0);
     t.months.forEach((mk,i)=>{const mi=MIDX[mk]; if(mi!=null)arr[mi]=t.rev[i]||0;}); REVT[t.type]=arr; }
   const unatt=MONTHS.map((_,mi)=>{ let u=0; selected.forEach(t=>{u+=Math.max(0,(REVT[t]?.[mi]||0)-(ATTR[t]?.[mi]||0));}); return u; });
-  const nm=data.noMatchAgg.filter(r=>selected.has(r.type) || isUnmappedType(config,r.type));
-  const nmTotals=nm.reduce((a,r)=>({n:a.n+r.n,amt:a.amt+r.arr}),{n:0,amt:0});
-  const nmByCohort={}; nm.forEach(r=>{nmByCohort[r.cohort]=(nmByCohort[r.cohort]||0)+r.arr;});
   let se=0,sa=0,jE=0,jA=0,totArr=0,totDeals=0; const jIdx=MIDX[detailMonth];
   for(const r of rows){ totArr+=r.arr; totDeals+=r.deals0;
     r.exp.forEach((e,i)=>{ const mi=MIDX[r.c]+i;
       if(mi<MONTHS.length-1){se+=e;sa+=r.act[i];} if(mi===jIdx){jE+=e;jA+=r.act[i];} }); }
-  return { rows, maxSpan, unatt, nmTotals, nmByCohort, MONTHS, MIDX, last, detailMonth, cohorts,
+  return { rows, maxSpan, unatt, MONTHS, MIDX, last, detailMonth, cohorts,
     overall: se>0?sa/se:null, junPct: jE>0?jA/jE:null, totArr, totDeals };
 }
 
@@ -371,7 +364,7 @@ const state = {
   selected:new Set(), view:"msc", metric:"pct",
   typesOpen:false, modal:null, drawer:false,
 };
-const defaultSelection = cfg => new Set(cfg.order.filter(s=>cfg.types[s].on && cfg.types[s].cols.length));
+const defaultSelection = (cfg, data) => { const gt=gridTypes(data); return new Set(gt.length ? gt : cfg.order.filter(s=>cfg.types[s].cols && cfg.types[s].cols.length)); };
 function setState(patch){ Object.assign(state, patch); render(); }
 
 /* ---------------- actions ---------------- */
@@ -385,7 +378,7 @@ async function doRefresh(cfgOverride){
     try{ await saveConfig(merged); }catch(e){ console.warn("config cache failed", e); }
     setState({ discovered:disc, config:merged, busyMsg:"Querying Snowflake — cohort grid, revenue totals, no-match…" });
     const fresh = await refreshAll(merged, nowMonthKey());
-    const selected = state.selected.size ? state.selected : defaultSelection(merged);
+    const selected = state.selected.size ? state.selected : defaultSelection(merged, fresh);
     setState({ data:fresh, selected, phase:"ready", busyMsg:"" });
     // cache is best-effort: a failed write must never break a completed refresh
     try{ await saveData(fresh); }catch(e){ console.warn("data cache failed", e); }
@@ -395,7 +388,7 @@ async function doRefresh(cfgOverride){
 }
 async function saveConfigAndRefresh(newCfg){
   try{ await saveConfig(newCfg); }catch(e){ console.warn("config cache failed", e); }
-  setState({ config:newCfg, selected:defaultSelection(newCfg), drawer:false });
+  setState({ config:newCfg, selected:new Set(), drawer:false });
   await doRefresh(newCfg);
 }
 
@@ -408,7 +401,7 @@ async function saveConfigAndRefresh(newCfg){
     const savedCfg = await loadConfig();
     const cfg = (savedCfg && savedCfg.order) ? savedCfg : seedConfig();
     const cached = await loadData();
-    if(cached && cached.grid){ setState({ config:cfg, data:cached, selected:defaultSelection(cfg), phase:"ready" }); }
+    if(cached && cached.grid){ setState({ config:cfg, data:cached, selected:defaultSelection(cfg, cached), phase:"ready" }); }
     else { setState({ config:cfg, phase:"needsConnect" }); }
   }catch(e){ setState({ error:String(e?.message||e), phase:"error" }); }
 })();
@@ -429,6 +422,10 @@ function render(){
   else if(state.phase==="busy" && !state.data) main.appendChild(Splash(state.busyMsg||"Working…", "spin"));
 
   if(state.data && state.config){
+    const cloudOrder = Object.fromEntries(CLOUDS.map((c,i)=>[c.id,i]));
+    state.types = gridTypes(state.data).sort((a,b)=>{
+      const ca=cloudOrder[typeCloud(state.config,a)]??9, cb=cloudOrder[typeCloud(state.config,b)]??9;
+      return ca-cb || typeName(state.config,a).localeCompare(typeName(state.config,b)); });
     const model = computeModel(state.data, state.selected, state.config);
     state._model = model;
     if(state.phase==="busy") main.appendChild(h("div",{style:{fontSize:"12px",color:T.orange,marginBottom:"16px",display:"flex",gap:"8px",alignItems:"center"}}, spinIcon(), state.busyMsg));
@@ -493,7 +490,7 @@ function ConnectCard(){
 function ScopeBar(model){
   const cfg=state.config;
   const clouds=mappedCloudIds(cfg);
-  const allSel=cfg.order.filter(s=>cfg.types[s].on && cfg.types[s].cols.length);
+  const allSel=state.types||[];
   let activeCloud="custom";
   if(state.selected.size===allSel.length && allSel.length) activeCloud="all";
   else for(const cl of clouds){ const codes=cloudSlugs(cfg,cl.id); if(codes.length && codes.length===state.selected.size && codes.every(c=>state.selected.has(c))){activeCloud=cl.id;break;} }
@@ -518,7 +515,7 @@ function TypePanel(){
     codes.forEach(code=>{
       const on=state.selected.has(code);
       col.appendChild(h("label",{style:{display:"flex",alignItems:"center",gap:"8px",padding:"4px 0",cursor:"pointer",fontSize:"13px",color:on?T.body:T.muted}, onClick:()=>toggle(code)},
-        checkBox(on), cfg.types[code].name));
+        checkBox(on), typeName(cfg,code)));
     });
     grid.appendChild(col);
   });
@@ -535,7 +532,7 @@ function checkBox(on, size=14){
 }
 function StatStrip(model){
   const cfg=state.config;
-  const allSel=cfg.order.filter(s=>cfg.types[s].on && cfg.types[s].cols.length);
+  const allSel=state.types||[];
   let activeCloud="custom", clouds=mappedCloudIds(cfg);
   if(state.selected.size===allSel.length && allSel.length) activeCloud="all";
   else for(const cl of clouds){ const codes=cloudSlugs(cfg,cl.id); if(codes.length===state.selected.size && codes.every(c=>state.selected.has(c))){activeCloud=cl.id;break;} }
@@ -543,7 +540,7 @@ function StatStrip(model){
   const grid=h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))",border:`1px solid ${T.divider}`,background:T.surface,marginTop:"24px"}});
   grid.appendChild(Stat(`Overall attainment · ${scopeLabel}`, fmtPct(model.overall), `through ${keyToLabel(model.detailMonth)}`, true));
   grid.appendChild(Stat("Closed ARR in view", fmtMoney(model.totArr), `${model.cohorts.length?keyToLabel(model.cohorts[0]):""} – ${keyToLabel(model.last)}`));
-  grid.appendChild(Stat("Merchant-deals in view", model.totDeals.toLocaleString(), "matched to Monthly Report"));
+  grid.appendChild(Stat("Deals in view", model.totDeals.toLocaleString(), "closed-won · NB + XSell"));
   grid.appendChild(Stat(`${keyToLabel(model.detailMonth)} attainment`, fmtPct(model.junPct), "last complete month"));
   return grid;
 }
@@ -559,7 +556,7 @@ function FooterNote(){
     stops.map(([l,hh])=>h("span",{style:{fontSize:"10px",fontWeight:600,letterSpacing:"0.04em",padding:"4px 8px",background:hh.bg,color:hh.fg}}, l)));
   return h("div",{style:{marginTop:"24px",display:"flex",gap:"32px",flexWrap:"wrap",alignItems:"flex-start"}}, legend,
     h("p",{style:{fontSize:"12px",color:T.muted,maxWidth:"640px",margin:0,lineHeight:"20px"}},
-      "Attainment = attributed revenue ÷ (closed ARR ÷ 12), matched on Redo ID. Per merchant and deal type, each month’s revenue credits the most recent deal closed on or before that month, so re-signs never double count. Click any cell for a live deal-level view. Toggling deal types recomputes every number on this page."));
+      "Closed ARR is every NB+XSell closed-won deal in the cohort — matched or not, revenue or not. Attainment = attributed revenue ÷ (ARR ÷ 12); unmatched Redo IDs and zero-revenue deals attain $0 and drag the cohort down. Revenue credits the most recent deal closed on or before each month, so re-signs never double count. The Orphaned revenue row is the only revenue with no deal. Click any cell for the deal list."));
 }
 
 function CohortTable(model){
@@ -597,28 +594,15 @@ function CohortTable(model){
     });
     tbody.appendChild(tr);
   });
-  // No match row
-  const nmTr=h("tr");
-  nmTr.appendChild(h("td",{style:{position:"sticky",left:0,zIndex:1,background:T.surface,padding:"8px 16px",borderTop:`2px solid ${T.divider2}`,borderBottom:`1px solid ${T.divider}`,whiteSpace:"nowrap"}},
-    h("button",{style:{background:"none",border:"none",cursor:"pointer",padding:0,fontWeight:600,fontSize:"13px",color:T.muted,display:"inline-flex",alignItems:"center",gap:"8px"}, onClick:()=>setState({modal:{kind:"nomatch"}})},
-      icon(IC.alert,13), `No match / unmapped · ${model.nmTotals.n} deals`)));
-  nmTr.appendChild(h("td",{style:{...num,borderTop:`2px solid ${T.divider2}`,color:T.muted}}, fmtMoney(model.nmTotals.amt)));
-  nmTr.appendChild(h("td",{style:{...num,borderTop:`2px solid ${T.divider2}`,color:T.muted}}, model.nmTotals.n||"—"));
-  columns.forEach(c=>{
-    const style={...num,borderTop:`2px solid ${T.divider2}`,color:T.muted};
-    if(state.view==="msc"){ nmTr.appendChild(h("td",{style},"·")); return; }
-    let e=0; Object.entries(model.nmByCohort).forEach(([co,amt])=>{ if(co<=c.key) e+=amt/12; });
-    nmTr.appendChild(h("td",{style, title:"Expected revenue from deals whose Redo ID has no Monthly Report match"}, e>=1?fmtMoney(e):"·"));
-  });
-  tbody.appendChild(nmTr);
-  // Unattributed row
+  // Orphaned revenue row — mapped revenue from merchants with no deal of that type
   const unTr=h("tr");
-  unTr.appendChild(h("td",{style:{position:"sticky",left:0,zIndex:1,background:T.surface,padding:"8px 16px",borderBottom:`1px solid ${T.divider}`,fontWeight:600,fontSize:"13px",color:T.blue,whiteSpace:"nowrap"}, title:"Mapped-column revenue from merchants with no included deal of that type — ties the table to Monthly Report totals"},"Unattributed revenue"));
-  unTr.appendChild(h("td",{style:num},"—")); unTr.appendChild(h("td",{style:num},"—"));
+  const utTop={borderTop:`2px solid ${T.divider2}`};
+  unTr.appendChild(h("td",{style:{position:"sticky",left:0,zIndex:1,background:T.surface,padding:"8px 16px",...utTop,borderBottom:`1px solid ${T.divider}`,fontWeight:600,fontSize:"13px",color:T.blue,whiteSpace:"nowrap"}, title:"Orphaned revenue — mapped-column revenue from merchants with no closed-won deal of that type. This is the only revenue not tied to a deal (calendar view)."},"Orphaned revenue · no deal"));
+  unTr.appendChild(h("td",{style:{...num,...utTop}},"—")); unTr.appendChild(h("td",{style:{...num,...utTop}},"—"));
   columns.forEach(c=>{
-    if(state.view==="msc"){ unTr.appendChild(h("td",{style:{...num,color:"rgba(255,255,255,0.14)"}},"·")); return; }
+    if(state.view==="msc"){ unTr.appendChild(h("td",{style:{...num,...utTop,color:"rgba(255,255,255,0.14)"}},"·")); return; }
     const v=model.unatt[model.MIDX[c.key]]||0;
-    unTr.appendChild(h("td",{style:{...num,color:T.blue}}, v>=1?fmtMoney(v):"·"));
+    unTr.appendChild(h("td",{style:{...num,...utTop,color:T.blue}}, v>=1?fmtMoney(v):"·"));
   });
   tbody.appendChild(unTr);
   table.appendChild(tbody);
@@ -630,7 +614,6 @@ function renderOverlay(){
   const ov=document.getElementById("overlay"); ov.innerHTML="";
   if(state.drawer && state.config) ov.appendChild(ConfigDrawer());
   if(state.modal?.kind==="cell" && state._model) ov.appendChild(CellModal(state.modal));
-  if(state.modal?.kind==="nomatch" && state._model) ov.appendChild(NoMatchModal());
 }
 const mtd={padding:"8px 16px",borderBottom:`1px solid ${T.divider}`,fontSize:"12px"};
 const mtdNum={...mtd,fontVariantNumeric:"tabular-nums",textAlign:"right",whiteSpace:"nowrap"};
@@ -662,12 +645,13 @@ function CellModal(m){
   const slot=h("div",{style:{padding:"48px",textAlign:"center",color:T.muted,fontSize:"13px",display:"flex",gap:"10px",justifyContent:"center",alignItems:"center"}}, spinIcon(), "Querying deals…");
   body.appendChild(slot);
   const close=()=>setState({modal:null});
-  // fire live query
-  const types=selList(cfg,state.selected);
+  // fire live query — all deals in the cohort of the selected types (matched or not)
+  const allSlugs=(state.types||[]).filter(s=>state.selected.has(s));
+  const mt=mappedTypes(cfg).filter(t=>state.selected.has(t.slug));
   (async()=>{
     try{
-      if(!types.length){ slot.replaceWith(emptyCell()); return; }
-      const rows=await runSql(qCellDeals(types,m.cohort,m.month), ["name","rep","merchant","type","arr","actual","active"]);
+      if(!allSlugs.length){ slot.replaceWith(emptyCell()); return; }
+      const rows=await runSql(qCellDeals(mt,allSlugs,m.cohort,m.month), ["name","rep","merchant","type","arr","actual","active","matched"]);
       slot.replaceWith(CellTable(rows,m.month,cfg));
     }catch(err){
       const box=h("div",{style:{margin:"12px 24px",border:`1px solid ${T.red}`,background:"rgba(220,38,38,0.10)",padding:"10px 14px",fontSize:"12px",color:"#F5A399"}}, String(err?.message||err));
@@ -686,11 +670,14 @@ function CellTable(rows, month, cfg){
   rows.forEach(r=>{
     const active=Number(r.active)===1, arr=num(r.arr), actual=r.actual==null?null:num(r.actual), expected=arr/12;
     const p=active&&expected>0&&actual!=null?actual/expected:null; const hh=heat(p);
+    const unmatched=Number(r.matched)!==1;
     tb.appendChild(h("tr",{style:{opacity:active?1:0.4}},
-      h("td",{style:{...mtd,color:T.text}}, r.name, !active?h("span",{style:{fontSize:"9px",color:T.muted}}," · superseded"):null),
+      h("td",{style:{...mtd,color:T.text}}, r.name,
+        !active?h("span",{style:{fontSize:"9px",color:T.muted}}," · superseded")
+        :(unmatched?h("span",{style:{fontSize:"9px",color:T.orange}}," · no Redo ID match"):null)),
       h("td",{style:mtd}, r.rep||"—"),
       h("td",{style:mtd}, r.merchant),
-      h("td",{style:mtd}, cfg.types[r.type]?.name||r.type),
+      h("td",{style:mtd}, typeName(cfg,r.type)),
       h("td",{style:mtdNum}, fmtMoneyFull(arr)),
       h("td",{style:mtdNum}, fmtMoneyFull(expected)),
       h("td",{style:mtdNum}, active&&actual!=null?fmtMoneyFull(actual):"—"),
@@ -700,27 +687,6 @@ function CellTable(rows, month, cfg){
   table.appendChild(tb);
   return table;
 }
-function NoMatchModal(){
-  const model=state._model, cfg=state.config;
-  const rows=(state.data.noMatchDeals||[]).filter(r=>state.selected.has(r.type) || isUnmappedType(cfg,r.type));
-  const subtitle=h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"8px"}},
-    `${rows.length} of the largest deals shown (${model.nmTotals.n} deals, ${fmtMoney(model.nmTotals.amt)} ARR in view). NB+XSell closed-won deals we can’t score — unmatched Redo ID (not yet live, or a typo) or a product type with no mapped revenue column.`);
-  const table=h("table",{style:{width:"100%",borderCollapse:"collapse"}});
-  table.appendChild(h("thead",null,h("tr",null,
-    h("th",{style:thM()},"Deal"),h("th",{style:thM()},"Rep"),h("th",{style:thM()},"Redo ID"),h("th",{style:thM()},"Type"),h("th",{style:thM(1)},"Deal ARR"),h("th",{style:thM(1)},"Cohort"))));
-  const tb=h("tbody");
-  rows.forEach(r=>tb.appendChild(h("tr",null,
-    h("td",{style:{...mtd,color:T.text}}, r.name),
-    h("td",{style:mtd}, r.rep),
-    h("td",{style:{...mtd,fontSize:"10px",color:T.muted}}, r.redoId),
-    h("td",{style:mtd}, cfg.types[r.type]?.name||r.type),
-    h("td",{style:mtdNum}, fmtMoneyFull(r.arr)),
-    h("td",{style:mtdNum}, keyToLabel(r.cohort)))));
-  if(!rows.length) tb.appendChild(h("tr",null,h("td",{colspan:6,style:{...mtd,textAlign:"center",color:T.muted,padding:"32px"}},"No unmatched deals in the current view.")));
-  table.appendChild(tb);
-  return ModalShell("Unmeasured closed-won","No match / unmapped deals",subtitle,table,()=>setState({modal:null}));
-}
-
 /* ---------------- config drawer ---------------- */
 function cloneCfg(config){ const types={}; for(const k in config.types) types[k]={...config.types[k],cols:[...config.types[k].cols]}; return {types,order:[...config.order]}; }
 function ConfigDrawer(){

@@ -7,6 +7,13 @@ It answers: for the deals a rep closed in a given month (a *cohort*), what
 percentage of the expected monthly revenue (deal ARR ÷ 12) are we actually
 *attaining* from the relevant revenue streams, month by month?
 
+A cohort's booked ARR always equals the **total closed-won amount** for that
+month, regardless of whether a deal has revenue tied to it. A deal whose Redo ID
+never matched the Monthly Report (e.g. Marc Jacobs), or whose product type has no
+mapped revenue column, still counts toward its cohort — it simply attains $0 and
+drags attainment down. Only *orphaned revenue* (Monthly Report revenue with no
+deal behind it) lives outside the cohorts, in its own row.
+
 ## Data sources
 
 Everything runs as read-only SQL through the **Fridge Snowflake runtime API**
@@ -25,22 +32,25 @@ Merchant / Team ID).
 - **Cohort month** = `CLOSED_WON` converted to **America/Denver (MST)** then
   truncated to the month.
 - **Expected monthly** = deal `DEAL_AMOUNT` ÷ 12 (HubSpot amount is annualized).
+- **Cohort scope — every closed-won deal counts.** A cohort's ARR is the sum of
+  every NB+XSell closed-won deal that month, matched or not, mapped type or not.
+  Unmatched deals (no Redo ID in the report) and unmapped product types are still
+  in the cohort — they attain $0, so they lower attainment rather than disappear.
+  This makes each cohort's booked ARR tie out to HubSpot closed-won (e.g. Jun '26
+  = $12.03M).
 - **Attribution — latest deal wins:** for each merchant + deal type, each
-  month's revenue and expected value credit the most recent deal closed on or
-  before that month. Superseded re-signs drop out of both numerator and
-  denominator from that month on, so re-signed merchants never double-count.
+  month's attributed revenue credits the most recent deal closed on or before
+  that month. Superseded re-signs go inactive from that month on, so re-signed
+  merchants never double-count revenue (their ARR still stays in the original
+  cohort's bookings).
 - **Attainment** = Σ attributed revenue ÷ Σ expected, recomputed live for
   whatever deal types are in view.
 - **Bookings scope** — only the **New Business + XSell** pipelines count as
   closed-won bookings (Upsell, Churn, Acquisitions, etc. are excluded), matching
   HubSpot's closed-won figures.
-- **No match / unmapped** row — a complete reconciliation bucket: every NB+XSell
-  closed-won deal *not* in the matched grid (unmatched Redo ID, or a product type
-  with no mapped revenue column). Grid ARR + this bucket ties out to HubSpot
-  closed-won per cohort (e.g. Jun '26 = $10.06M grid + $1.97M unmeasured =
-  $12.03M).
-- **Unattributed revenue** row — mapped-column revenue from merchants with no
-  included deal of that type, so the table reconciles to Monthly Report totals.
+- **Orphaned revenue** row — mapped-column revenue from merchants with *no*
+  deal of that type behind it. This is the only bucket that lives outside the
+  cohorts; it reconciles the table to Monthly Report totals.
 
 The deal-type → revenue-column mapping is fully editable in the **Configure**
 drawer (a type can sum multiple columns), and persists in `fridge.db`. The last
