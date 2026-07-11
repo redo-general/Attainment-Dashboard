@@ -105,18 +105,23 @@ const monthSpan = nowKey => { const [y,m]=nowKey.split("-").map(Number); return 
    Applied to both the deals scan (by TEAM_ID) and the report scan (by Merchant ID). */
 const notInTeam = ex => (ex && ex.length) ? `AND TEAM_ID NOT IN (${ex.map(sq).join(",")})` : "";
 const notInMids = ex => (ex && ex.length) ? `AND ${qid("Merchant ID")} NOT IN (${ex.map(sq).join(",")})` : "";
+/* Deal-type aliases: some PRODUCT slugs are, for reporting, the same product.
+   AI Exchange Agent deals are treated as Returns deals — same cohort, same
+   Returns revenue — so the PRODUCT is folded into 'returns' wherever a deal row's
+   type/slug is derived (grid, totals, discovery, cell drilldowns). */
+const ATYPE = `CASE WHEN LOWER(PRODUCT)='ai_exchange_agent' THEN 'returns' ELSE COALESCE(NULLIF(PRODUCT,''),'(none)') END`;
 function baseCTEs(types, span, excluded=[]){
   const slugs = types.map(t=>sq(t.slug)).join(",");
   return `
 months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${START}') AS m FROM TABLE(GENERATOR(ROWCOUNT => ${span}))),
 report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 deals AS (
-  SELECT TEAM_ID AS mid, PRODUCT AS type, DEAL_AMOUNT AS arr,
+  SELECT TEAM_ID AS mid, ${ATYPE} AS type, DEAL_AMOUNT AS arr,
          DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m, DEAL_ID
   FROM ${DEALS}
   WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND TEAM_ID IS NOT NULL
     AND PIPELINE_ID IN ${PIPES}
-    AND PRODUCT IN (${slugs}) AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
+    AND ${ATYPE} IN (${slugs}) AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}'
     AND TEAM_ID IN (SELECT mid FROM report_mids) ${notInTeam(excluded)})`;
 }
 function revLongCTE(types, extraWhere=""){
@@ -131,7 +136,7 @@ rev_long AS (
   UNPIVOT (rev FOR typecol IN (${al.join(",")}))),
 rev AS (SELECT mid, m, type, SUM(rev) AS rev FROM rev_long GROUP BY 1,2,3)`;
 }
-const qDealTypes = () => `SELECT PRODUCT AS slug, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr, MAX(PRODUCT_CLOUD) AS product_cloud
+const qDealTypes = () => `SELECT ${ATYPE} AS slug, COUNT(*) AS n, ROUND(SUM(DEAL_AMOUNT)) AS arr, MAX(PRODUCT_CLOUD) AS product_cloud
   FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' AND PRODUCT IS NOT NULL AND PRODUCT <> ''
   GROUP BY 1 ORDER BY n DESC`;
@@ -163,7 +168,7 @@ months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${
 lastm AS (SELECT MAX(m) AS m FROM months),
 report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 deals AS (
-  SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
+  SELECT TEAM_ID AS mid, ${ATYPE} AS type, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
     DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
   FROM ${DEALS}
@@ -202,7 +207,7 @@ const qCellDeals = (mappedTypes, allSlugs, cohort, month, excluded=[]) => {
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' GROUP BY 1),
 alld AS (SELECT DEAL_ID, DEAL_NAME AS name, COALESCE(NULLIF(AE_NAME,''),'—') AS rep, TEAM_ID AS mid,
-    COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr,
+    ${ATYPE} AS type, DEAL_AMOUNT AS arr,
     DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN 1 ELSE 0 END AS matched,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
@@ -224,7 +229,7 @@ ORDER BY a.arr DESC NULLS LAST LIMIT 500`; };
 const qOrphanDeals = (mappedTypes, month, excluded=[]) => {
   const md=`${month}-01`;
   return `WITH mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' GROUP BY 1),
-dealset AS (SELECT DISTINCT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type
+dealset AS (SELECT DISTINCT TEAM_ID AS mid, ${ATYPE} AS type
   FROM ${DEALS} WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
     AND TEAM_ID IS NOT NULL AND DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date <= DATE '${md}'),
 ${revLongCTE(mappedTypes, `AND ${qid("Date")} = DATE '${md}' ${notInMids(excluded)}`)},
@@ -261,7 +266,7 @@ months AS (SELECT DATEADD(month, ROW_NUMBER() OVER (ORDER BY seq4())-1, DATE '${
 lastm AS (SELECT MAX(m) AS m FROM months),
 report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 deals AS (
-  SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
+  SELECT TEAM_ID AS mid, ${ATYPE} AS type, DEAL_AMOUNT AS arr, DEAL_ID, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
     DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
   FROM ${DEALS}
@@ -311,7 +316,7 @@ const qMerchantCellDeals = (mappedTypes, cohort, month, excluded=[]) => {
   return `WITH report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
 mnames AS (SELECT ${qid("Merchant ID")} AS mid, MAX_BY(${qid("Merchant Name")}, ${qid("Date")}) AS name FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' GROUP BY 1),
 mrev AS (SELECT ${qid("Merchant ID")} AS mid, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev FROM ${REPORT} WHERE ${qid("Date")} = DATE '${md}' ${notInMids(excluded)} GROUP BY 1),
-alld AS (SELECT TEAM_ID AS mid, COALESCE(NULLIF(PRODUCT,''),'(none)') AS type, COALESCE(NULLIF(AE_NAME,''),'—') AS rep, DEAL_AMOUNT AS arr, DEAL_ID,
+alld AS (SELECT TEAM_ID AS mid, ${ATYPE} AS type, COALESCE(NULLIF(AE_NAME,''),'—') AS rep, DEAL_AMOUNT AS arr, DEAL_ID,
     DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN 1 ELSE 0 END AS matched,
     CASE WHEN TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids) THEN TEAM_ID ELSE 'deal:'||DEAL_ID END AS akey
@@ -709,11 +714,11 @@ let fridge=null, user=null;
 const state = {
   phase:"init", busyMsg:"", error:null,
   config:null, discovered:null, data:null,
-  selected:new Set(), view:"msc", metric:"pct",
+  selected:new Set(), view:"cal", metric:"pct",
   typesOpen:false, modal:null, drawer:false,
   repFilter:"__all__", excludeM0:false, project:false, showEarly:false,
   excluded:new Set(), merchants:null, merchantsOpen:false, merchantsLoading:false,
-  advancedOpen:false, runRate:false,
+  advancedOpen:false, runRate:true,
 };
 /* Run-rate view: displayed monthly $ are ×12 (annualized). Attainment ratios are
    unchanged since both numerator and denominator scale together. */
