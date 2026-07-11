@@ -145,7 +145,12 @@ const qRevenueColumns = () => `SELECT column_name AS col FROM KITCHEN.INFORMATIO
    Each (akey,type) group is the active deal from its close month until the next
    same-key deal closes (latest deal wins); a range-join to months expands only
    that window, avoiding a group-by-month cross product + ranking that timed out
-   on the runtime warehouse. The Fridge Snowflake runtime hard-caps every query
+   on the runtime warehouse. The report revenue scan is restricted to deal
+   merchants (Merchant ID IN deals) because rev only feeds a LEFT JOIN onto deal
+   rows here — unrestricted it re-unpivots every merchant's revenue on every page
+   and pushed a single page over the 30s cap. (qTotalMapped keeps the full report
+   scan; it needs every merchant for the orphaned-revenue total.) The Fridge
+   Snowflake runtime hard-caps every query
    at 500 rows, but the grid is one row per (cohort, type, rep) and runs into the
    thousands — so this is fetched a page at a time via the QUALIFY ROW_NUMBER
    window (lo..hi over a stable cohort/type/rep order); fetchGridPaged loops until
@@ -170,7 +175,7 @@ grp_win AS (SELECT mid, type, akey, close_m, arr, ndeals, rep,
   FROM grp),
 active AS (SELECT g.mid, g.type, g.close_m AS cohort, mo.m AS m, g.arr, g.ndeals, g.rep
   FROM grp_win g JOIN months mo ON mo.m >= g.close_m AND mo.m <= g.end_m),
-${revLongCTE(types, notInMids(excluded))},
+${revLongCTE(types, `${notInMids(excluded)} AND ${qid("Merchant ID")} IN (SELECT mid FROM deals)`)},
 joined AS (SELECT a.cohort, a.type, a.rep, a.m, a.arr/12 AS expected, COALESCE(r.rev,0) AS actual, a.ndeals
   FROM active a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type AND r.m=a.m),
 per_month AS (SELECT cohort, type, rep, m, SUM(expected) AS expected, SUM(actual) AS actual, SUM(ndeals) AS deals
