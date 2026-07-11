@@ -306,6 +306,33 @@ const qTotalRevenue = (excluded=[]) => `SELECT '__all__' AS type,
   ARRAY_AGG(TO_CHAR(m,'YYYY-MM')) WITHIN GROUP (ORDER BY m) AS mon_arr
 FROM (SELECT ${qid("Date")}::date AS m, ROUND(SUM(ZEROIFNULL(${qid("Total Revenue")})))::int AS rev
   FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)} GROUP BY 1)`;
+/* Pre-close revenue (the "Show Pre-Close" toggle): a deal merchant's Total
+   Revenue in the months BEFORE their first NB+XSell deal closed. It currently
+   lives in the Orphaned row; the toggle relabels it onto that merchant's
+   earliest cohort (per rep), shown in the columns before the cohort's close
+   month. One array per (cohort, rep); small (a few hundred rows) so it is
+   fetched unpaged. Matched merchants only (they are the ones with report
+   revenue). */
+const qMerchantPreClose = (excluded=[]) => `WITH
+report_mids AS (SELECT DISTINCT ${qid("Merchant ID")} AS mid FROM ${REPORT}),
+deals AS (
+  SELECT TEAM_ID AS mid, DEAL_AMOUNT AS arr, COALESCE(NULLIF(AE_NAME,''),'—') AS rep,
+    DATE_TRUNC('month', CONVERT_TIMEZONE('America/Denver', CLOSED_WON))::date AS close_m
+  FROM ${DEALS}
+  WHERE HS_IS_CLOSED_WON = TRUE AND CLOSED_WON IS NOT NULL AND PIPELINE_ID IN ${PIPES}
+    AND TEAM_ID IS NOT NULL AND TEAM_ID IN (SELECT mid FROM report_mids)
+    AND CONVERT_TIMEZONE('America/Denver', CLOSED_WON) >= DATE '${START}' ${notInTeam(excluded)}),
+earliest AS (SELECT mid, MIN(close_m) AS cohort FROM deals GROUP BY 1),
+erep AS (SELECT d.mid, MAX_BY(d.rep, d.arr) AS rep FROM deals d JOIN earliest e ON e.mid=d.mid AND d.close_m=e.cohort GROUP BY 1),
+totrev AS (SELECT ${qid("Merchant ID")} AS mid, ${qid("Date")} AS m, SUM(ZEROIFNULL(${qid("Total Revenue")})) AS rev
+  FROM ${REPORT} WHERE ${qid("Date")} >= DATE '${START}' ${notInMids(excluded)} GROUP BY 1,2),
+preclose AS (SELECT e.cohort, r.rep, tr.m, SUM(tr.rev) AS rev
+  FROM earliest e JOIN erep r ON r.mid=e.mid JOIN totrev tr ON tr.mid=e.mid AND tr.m < e.cohort
+  GROUP BY 1,2,3)
+SELECT TO_CHAR(cohort,'YYYY-MM') AS cohort, '__all__' AS type, rep,
+  ARRAY_AGG(ROUND(rev)::int) WITHIN GROUP (ORDER BY m) AS rev_arr,
+  ARRAY_AGG(TO_CHAR(m,'YYYY-MM')) WITHIN GROUP (ORDER BY m) AS mon_arr
+FROM preclose WHERE rev >= 1 GROUP BY cohort, rep`;
 /* Detail for an "All products" cohort cell: each (merchant, product-type) line
    whose latest deal of that product on/before the month closed in this cohort,
    with its bookings and the share of the merchant's Total Revenue allocated to it
@@ -421,16 +448,17 @@ function mergeDiscovery(config, disc){
    Revenue" onto the helpdesk type (Platform cloud = Helpdesk + Support AI + AEO
    + Reclaim exactly). Returns true when it actually changed a mapping (so the
    caller can re-query the now-stale cached grid). */
-const CONFIG_MIG = 2;
+const CONFIG_MIG = 3;
 function migrateConfig(cfg){
   const from = cfg.mig || 0;
   if(from < 1){
     const h = cfg.types && cfg.types.helpdesk;
     if(h && Array.isArray(h.cols) && !h.cols.includes("Support AI Revenue")) h.cols.push("Support AI Revenue");
   }
-  // mig 2 changes no mapping, but the reconciliation query changed (International
-  // Returns is now treated as a child of Returns), so the cached recon is stale.
-  // Any version advance returns true, so boot re-queries once to refresh it.
+  // Later migrations change queries, not mappings (mig 2: International Returns
+  // treated as a child of Returns; mig 3: pre-close revenue series added), so the
+  // cached data is stale. Any version advance returns true, so boot re-queries
+  // once to refresh it.
   cfg.mig = CONFIG_MIG;
   return from < CONFIG_MIG;
 }
@@ -490,20 +518,22 @@ async function fetchMerchantGridPaged(mt, span, excluded){
 }
 const mapGridRows = grid => grid.map(r=>({cohort:r.cohort, type:r.type, rep:r.rep||"—", exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)}));
 const mapRevRows = tot => tot.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)}));
+const mapPreRows = pre => pre.map(r=>({cohort:r.cohort, rep:r.rep||"—", rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)}));
 async function refreshAll(config, nowKey, excluded=[]){
   const mt = mappedTypes(config);
   if(!mt.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
   const span = monthSpan(nowKey);
-  const [grid, totalMapped, mgrid, mrev, recon] = await Promise.all([
+  const [grid, totalMapped, mgrid, mrev, recon, mpreclose] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
     fetchMerchantGridPaged(mt, span, excluded),
     runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
     runSql(qReconcile(config,excluded), RECON_COLS).then(r=>r[0]||null).catch(()=>null),
+    runSql(qMerchantPreClose(excluded), ["cohort","type","rep","rev_arr","mon_arr"]).catch(()=>[]),
   ]);
   return {
     grid: mapGridRows(grid), totalMapped: mapRevRows(totalMapped),
-    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev), recon,
+    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev), recon, mpreclose: mapPreRows(mpreclose),
     nowKey, refreshedAt: new Date().toISOString(),
   };
 }
@@ -513,16 +543,17 @@ async function refreshAll(config, nowKey, excluded=[]){
 async function gridWithExclusions(config, nowKey, excluded){
   const mt = mappedTypes(config);
   const span = monthSpan(nowKey);
-  const [grid, totalMapped, mgrid, mrev, recon] = await Promise.all([
+  const [grid, totalMapped, mgrid, mrev, recon, mpreclose] = await Promise.all([
     fetchGridPaged(mt, span, excluded),
     runSql(qTotalMapped(mt,span,excluded), ["type","rev_arr","mon_arr"]),
     fetchMerchantGridPaged(mt, span, excluded),
     runSql(qTotalRevenue(excluded), ["type","rev_arr","mon_arr"]),
     runSql(qReconcile(config,excluded), RECON_COLS).then(r=>r[0]||null).catch(()=>null),
+    runSql(qMerchantPreClose(excluded), ["cohort","type","rep","rev_arr","mon_arr"]).catch(()=>[]),
   ]);
   return {
     grid: mapGridRows(grid), totalMapped: mapRevRows(totalMapped),
-    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev), recon,
+    mgrid: mapGridRows(mgrid), mrev: mapRevRows(mrev), recon, mpreclose: mapPreRows(mpreclose),
   };
 }
 const STORE = { config:"attainment_config", data:"attainment_data" };
@@ -555,7 +586,7 @@ async function saveData(x){
   const nGrid = await chunkRows(col, x.grid, "grid");
   const nM = await chunkRows(col, x.mgrid||[], "mgrid");
   await col.create({value:{ v:7, chunks:nGrid, mchunks:nM, rows:x.grid.length, mrows:(x.mgrid||[]).length,
-    totalMapped:x.totalMapped, mrev:x.mrev, recon:x.recon||null, nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
+    totalMapped:x.totalMapped, mrev:x.mrev, recon:x.recon||null, mpreclose:x.mpreclose||[], nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
 }
 async function loadData(){
   try{
@@ -568,7 +599,7 @@ async function loadData(){
     // silently showing a grid with cohorts missing — the bug this guards against.
     if(typeof man.rows==="number" && grid.length!==man.rows) return null;
     if(typeof man.mrows==="number" && mgrid.length!==man.mrows) return null;
-    return { grid, mgrid, totalMapped:man.totalMapped, mrev:man.mrev, recon:man.recon||null, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
+    return { grid, mgrid, totalMapped:man.totalMapped, mrev:man.mrev, recon:man.recon||null, mpreclose:man.mpreclose||[], nowKey:man.nowKey, refreshedAt:man.refreshedAt };
   }catch{ return null; }
 }
 
@@ -613,7 +644,19 @@ function computeModel(data, selected, config, opts={}){
     r.exp.forEach((e,i)=>{ if(excludeM0 && i===0) return; const mi=MIDX[r.c]+i;
       if(mi<MONTHS.length-1){se+=e;sa+=r.act[i];} if(mi===jIdx){jE+=e;jA+=r.act[i];} }); }
   const reps = [...new Set(data.grid.map(s=>s.rep||"—"))].sort((a,b)=>a.localeCompare(b));
-  return { rows, maxSpan, unatt, MONTHS, MIDX, last, detailMonth, cohorts, reps, excludeM0, repFilter,
+  // Pre-close revenue (Show Pre-Close): revenue in the months before a cohort's
+  // close month. preCM keys cohort|month; preMonth totals per month so the
+  // Orphaned row can net it out (it currently lives there). Attainment ratios are
+  // untouched — pre-close has no expected, so it never enters se/sa/jE/jA.
+  const preCM={}, preMonth={};
+  if(data.preclose){
+    for(const p of data.preclose){
+      if(repFilter!=="__all__" && (p.rep||"—")!==repFilter) continue;
+      (p.months||[]).forEach((mk,i)=>{ const v=p.rev[i]||0; if(!v) return;
+        preCM[`${p.cohort}|${mk}`]=(preCM[`${p.cohort}|${mk}`]||0)+v; preMonth[mk]=(preMonth[mk]||0)+v; });
+    }
+  }
+  return { rows, maxSpan, unatt, MONTHS, MIDX, last, detailMonth, cohorts, reps, excludeM0, repFilter, preCM, preMonth,
     overall: se>0?sa/se:null, junPct: jE>0?jA/jE:null, totArr, totDeals };
 }
 
@@ -716,7 +759,7 @@ const state = {
   config:null, discovered:null, data:null,
   selected:new Set(), view:"cal", metric:"pct",
   typesOpen:false, modal:null, drawer:false,
-  repFilter:"__all__", excludeM0:false, project:false, showEarly:false,
+  repFilter:"__all__", excludeM0:false, project:false, showEarly:false, showPreClose:false,
   excluded:new Set(), merchants:null, merchantsOpen:false, merchantsLoading:false,
   advancedOpen:false, runRate:true,
 };
@@ -757,7 +800,7 @@ async function applyExclusions(){
   setState({ phase:"busy", error:null, busyMsg: ex.length?`Recomputing without ${ex.length} merchant${ex.length>1?"s":""}…`:"Restoring all merchants…" });
   try{
     const filtered = await gridWithExclusions(state.config, state.data.nowKey, ex);
-    setState({ data:{...state.data, grid:filtered.grid, totalMapped:filtered.totalMapped, mgrid:filtered.mgrid, mrev:filtered.mrev}, phase:"ready", busyMsg:"" });
+    setState({ data:{...state.data, grid:filtered.grid, totalMapped:filtered.totalMapped, mgrid:filtered.mgrid, mrev:filtered.mrev, mpreclose:filtered.mpreclose}, phase:"ready", busyMsg:"" });
   }catch(e){
     setState({ error:String(e?.message||e), phase:"ready", busyMsg:"" });
   }
@@ -854,7 +897,7 @@ function render(){
     const merchantView = !!(state.data.mgrid && state.types.length && state.selected.size===state.types.length);
     state._merchantView = merchantView;
     const model = merchantView
-      ? computeModel({grid:state.data.mgrid, totalMapped:state.data.mrev, nowKey:state.data.nowKey}, new Set(["__all__"]), state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0})
+      ? computeModel({grid:state.data.mgrid, totalMapped:state.data.mrev, nowKey:state.data.nowKey, preclose:state.data.mpreclose}, new Set(["__all__"]), state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0})
       : computeModel(state.data, state.selected, state.config, {repFilter:state.repFilter, excludeM0:state.excludeM0});
     state._model = model;
     state._checks = runChecks(state.data, state.config);
@@ -971,7 +1014,7 @@ function ControlsBar(model){
   const cal = state.view==="cal";
   const activeCount = (state.repFilter!=="__all__"?1:0) + (state.excluded.size?1:0)
     + (state.excludeM0?1:0) + (state.runRate?1:0)
-    + (cal && state.project?1:0) + (cal && state.showEarly?1:0);
+    + (cal && state.project?1:0) + (cal && state.showEarly?1:0) + (cal && state._merchantView && state.showPreClose?1:0);
   const bar=h("div",{style:{marginTop:"16px"}});
   const advBtn=h("button",{style:{...btnStyle(state.advancedOpen||activeCount>0), gap:"8px"},
     onClick:()=>setState({advancedOpen:!state.advancedOpen})},
@@ -1008,6 +1051,9 @@ function ControlsBar(model){
     wrap.appendChild(h("button",{style:btnStyle(state.project), title:"Project the current partial month to a full-month run-rate (scales MTD by days elapsed).", onClick:()=>setState({project:!state.project})}, state.project?"Projecting month":"Project month"));
     // Show earlier months (fix: default to Jan '25 onward with expand button)
     wrap.appendChild(h("button",{style:btnStyle(state.showEarly), onClick:()=>setState({showEarly:!state.showEarly})}, state.showEarly?"Hide pre-2025":"Show earlier months"));
+    // Show Pre-Close: relabel each cohort's pre-close revenue (currently Orphaned)
+    // onto the cohort in the months before its close. All-products view only.
+    if(state._merchantView) wrap.appendChild(h("button",{style:btnStyle(state.showPreClose), title:"Show each cohort's revenue in the months before its deal closed (pulled from Orphaned). No bookings exist pre-close, so those cells show revenue only, not attainment %.", onClick:()=>setState({showPreClose:!state.showPreClose})}, state.showPreClose?"Hiding pre-close":"Show pre-close"));
   }
   bar.appendChild(wrap);
   return bar;
@@ -1123,6 +1169,9 @@ function CohortTable(model, merchantView){
   const projectCol = key => cal && state.project && key===curMonth;
   // Orphaned revenue has no rep, so it only makes sense in the all-reps view.
   const showOrphan = state.repFilter==="__all__";
+  // Show Pre-Close: only in the All-products calendar view; relabels pre-close
+  // revenue from Orphaned onto the cohort's pre-close months.
+  const showPre = !!(state.showPreClose && merchantView && cal);
   // Default to Jan '25 onward in calendar view; button reveals earlier months.
   let months = model.MONTHS;
   if(cal && !state.showEarly) months = months.filter(m=>m>="2025-01");
@@ -1174,7 +1223,19 @@ function CohortTable(model, merchantView){
     tr.appendChild(h("td",{style:stTd(Ld,W.dl,rowBg)}, r.deals0||"—"));
     columns.forEach(col=>{
       const i = cal?monthDiff(r.c,col.key):col.key;
-      if(i<0||i>=r.span){ tr.appendChild(h("td",{style:{...num,color:"rgba(255,255,255,0.14)"}},"·")); return; }
+      if(i<0){
+        // Pre-close month: revenue that existed before this cohort's deal closed.
+        const pv = showPre ? (model.preCM[`${r.c}|${col.key}`]||0) : 0;
+        if(pv>=1){ const rr=rrMult();
+          tr.appendChild(h("td",{style:{padding:"2px",borderBottom:`1px solid ${T.divider}`}},
+            h("div",{class:"cell", title:`${keyToLabel(r.c)} cohort · ${keyToLabel(col.key)} · pre-close\n${fmtMoneyFull(pv*rr)} revenue before the deal closed — no bookings yet, so no attainment %`,
+              style:{width:"100%",background:"rgba(8,138,178,0.12)",color:T.blue,fontVariantNumeric:"tabular-nums",fontSize:"11px",fontWeight:600,padding:"6px",textAlign:"right",fontStyle:"italic"}},
+              state.metric==="pct"?"—":fmtMoney(pv*rr))));
+          return;
+        }
+        tr.appendChild(h("td",{style:{...num,color:"rgba(255,255,255,0.14)"}},"·")); return;
+      }
+      if(i>=r.span){ tr.appendChild(h("td",{style:{...num,color:"rgba(255,255,255,0.14)"}},"·")); return; }
       let e=r.exp[i]??0, a=r.act[i]??0; const d=r.dls[i]??0;
       if(e<=0 && a===0){ tr.appendChild(h("td",{style:{...num,color:"rgba(255,255,255,0.14)"}},"·")); return; }
       const m = cal?col.key:addMonths(r.c,i);
@@ -1201,6 +1262,7 @@ function CohortTable(model, merchantView){
   columns.forEach(c=>{
     if(!cal){ unTr.appendChild(h("td",{style:{...num,...utTop,color:"rgba(255,255,255,0.14)"}},"·")); return; }
     let v=model.unatt[model.MIDX[c.key]]||0;
+    if(showPre) v = Math.max(0, v - (model.preMonth[c.key]||0));
     if(projectCol(c.key)) v *= factor;
     if(v<1){ unTr.appendChild(h("td",{style:{...num,...utTop,color:"rgba(255,255,255,0.14)"}},"·")); return; }
     const rr=rrMult();
