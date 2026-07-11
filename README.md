@@ -66,12 +66,69 @@ re-queries only on **Refresh** or a config change.
   implementation). `npm run build` bundles it via esbuild.
 - **`build.mjs`, `package.json`** — esbuild config for the React variant.
 
-## Deploying updates
+## Publishing changes to the live app
 
-The Fridge site is a static-only deployment. To update the served app, edit
-`index.html` and republish through the Redo Unified MCP
-(`fridge_publish_site_files`, `html` param) or push to the site's hidden Git
-remote. Config and cached data survive redeploys (they live in `fridge.db`).
+The Fridge site is a static-only deployment (slug **`deal-attainment`**, a single
+`index.html`). There is one reliable, one-step way to republish — use it every
+time:
+
+**Call the `fridge_publish_site_files` MCP tool** (Redo Unified server):
+
+```js
+fridge_publish_site_files({
+  slug:       "deal-attainment",
+  entrypoint: "index.html",
+  html:       /* the entire contents of index.html */,
+})
+```
+
+That's the whole deploy. The tool uploads the file and **commits it through
+Fridge's hidden Git server-side**, then a build worker publishes it a few
+seconds later. Config and cached data live in `fridge.db` and survive every
+redeploy — you never lose the deal-type→column mapping or the cached grid.
+
+Then verify (recommended):
+
+- `fridge_get_site({ slug: "deal-attainment" })` → confirm
+  `latestDeployment.version` bumped and
+  `latestDeployment.metadata.worker.status === "succeeded"`.
+- Compare the deployed `index.html` `sha256` in that response against your local
+  file (`sha256sum index.html`) if you want byte-for-byte proof.
+
+### Do NOT `git push` to the Fridge remote from a web/remote session
+
+The site *does* have a hidden Git remote
+(`https://git.fridge.redo.builders/deal-attainment.git`), and cloning/pushing to
+it works from a normal workstation. **But Claude Code web/remote sessions run
+behind a network policy that blocks outbound traffic to that host**, so a push
+fails with a DNS/egress error and sends you down a debugging rabbit hole. This
+is the single biggest reason republishing has felt slow. In these sessions,
+always publish with `fridge_publish_site_files` — it does the commit server-side
+and never touches local egress.
+
+### Keep the repo copy in sync
+
+`index.html` in this repo is the source of truth. Edit it here, commit to the
+working branch, then publish the *same* file with the tool above so the live app
+and the repo never drift.
+
+### Other deployment tools (rarely needed)
+
+- `fridge_read_deployed_file` — read the live artifact back.
+- `fridge_list_deployments` / `fridge_diff_revisions` — history and diffs.
+- `fridge_redeploy_commit` — redeploy an existing commit without re-uploading.
+- `fridge_rollback_site` — roll back to a previous good deployment.
+
+### Why republishing has felt slow
+
+The publish itself is fast — a few seconds. What eats the time is *rediscovery*:
+with no runbook, the natural first move is `git push` to the hidden remote, which
+this environment silently blocks, so each session re-debugs egress before landing
+on the MCP tool. Two smaller factors: the whole ~80 KB `index.html` is sent
+inline in the tool call (it's a single-file app, so there's no incremental
+upload), and the deploy is asynchronous — the tool queues a build that a worker
+finishes a few seconds later, so verifying means a short poll. Following the
+runbook above removes the only genuinely slow part.
 
 ## Why not a claude.ai artifact?
 
