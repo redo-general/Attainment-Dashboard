@@ -83,17 +83,40 @@ fridge_publish_site_files({
 ```
 
 That's the whole deploy. The tool uploads the file and **commits it through
-Fridge's hidden Git server-side**, then a build worker publishes it a few
-seconds later. Config and cached data live in `fridge.db` and survive every
-redeploy — you never lose the deal-type→column mapping or the cached grid.
+Fridge's hidden Git server-side**, then a build worker publishes it. Config and
+cached data live in `fridge.db` and survive every redeploy — you never lose the
+deal-type→column mapping or the cached grid.
 
-Then verify (recommended):
+### Then force the build and verify by sha — do NOT poll `get_site`
 
-- `fridge_get_site({ slug: "deal-attainment" })` → confirm
-  `latestDeployment.version` bumped and
-  `latestDeployment.metadata.worker.status === "succeeded"`.
-- Compare the deployed `index.html` `sha256` in that response against your local
-  file (`sha256sum index.html`) if you want byte-for-byte proof.
+The commit is instant; the *build worker* is the variable part, and two traps
+turn a ~1-minute deploy into a ~5-minute one:
+
+- **The push-webhook that kicks off the build is often slow or missed** (observed
+  it sit 50s+ before the worker even started). Don't wait for it — force it.
+- **`fridge_get_site` / `fridge_list_deployments` keep reporting `pending` for
+  minutes after the deploy has actually succeeded.** Their status field is a
+  lagging cache; polling it is the single biggest time-waster and makes a live
+  deploy look stuck.
+
+So, right after publishing:
+
+```js
+// publish returns the commit sha:
+const sha = pub.deployment.metadata.uploadCommit.after;
+// force the worker instead of waiting on the webhook — its response is truthful:
+const r = fridge_redeploy_commit({ slug:"deal-attainment", branch:"main",
+                                   commitSha: sha, confirmRedeploy:true });
+// done when: r.deployment.metadata.worker.status === "succeeded"
+//        and r.deployment.metadata.files[0].sha256 === `sha256sum index.html`
+```
+
+If that response shows `worker.status:"succeeded"` and the sha matches your local
+file, it's live — stop there. For an independent confirmation, use
+`fridge_read_deployed_file` (or fetch the live URL) and compare sha; never treat
+the `pending`/`active` field on the list/get endpoints as a completion signal.
+Also check the publish response's `totalBytes` equals `wc -c index.html` — a
+quick guard that the inline upload wasn't truncated.
 
 ### Do NOT `git push` to the Fridge remote from a web/remote session
 
@@ -121,14 +144,24 @@ and the repo never drift.
 
 ### Why republishing has felt slow
 
-The publish itself is fast — a few seconds. What eats the time is *rediscovery*:
-with no runbook, the natural first move is `git push` to the hidden remote, which
-this environment silently blocks, so each session re-debugs egress before landing
-on the MCP tool. Two smaller factors: the whole ~80 KB `index.html` is sent
-inline in the tool call (it's a single-file app, so there's no incremental
-upload), and the deploy is asynchronous — the tool queues a build that a worker
-finishes a few seconds later, so verifying means a short poll. Following the
-runbook above removes the only genuinely slow part.
+The build itself is fast (~2s). The wasted time is almost always one of these,
+in rough order of impact:
+
+1. **Polling the lagging status endpoints.** `get_site`/`list_deployments` show
+   `pending` for minutes after success — wait on them and you burn time on a
+   deploy that already finished. Fix: force with `fridge_redeploy_commit` and
+   trust *its* response + the deployed sha (above).
+2. **Waiting on the slow/missed push-webhook** instead of forcing the build.
+3. **`git push` to the hidden remote** — this environment's network policy blocks
+   `git.fridge.redo.builders`, so a push fails and sends you down an egress
+   rabbit hole. Always use `fridge_publish_site_files`.
+4. **Fixed cost:** the whole ~80 KB `index.html` is sent inline every publish
+   (single-file app, no incremental upload). Unavoidable, not a bug.
+
+A plain "publish the latest code" following the runbook is ~1 minute. Anything
+longer is usually a real bug being diagnosed (measure queries against Snowflake
+directly — see the deploy history in git for examples), which is separate from
+the deploy itself.
 
 ## Why not a claude.ai artifact?
 
