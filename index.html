@@ -92,6 +92,15 @@ const heat = pct => {
 const prettify = s => s.replace(/_/g," ").replace(/\b\w/g,c=>c.toUpperCase());
 const nowMonthKey = () => new Intl.DateTimeFormat("en-CA",{timeZone:"America/Denver",year:"numeric",month:"2-digit"}).format(new Date()).slice(0,7);
 
+/* Product-adoption buckets: how many distinct Redo products a merchant has
+   revenue from in a month (1,2,3,4,5+). Ordinal ramp — one hue (orange),
+   dimmest→brightest with count. Validated colorblind-safe on the dark surface
+   via the dataviz palette validator (ordinal mode). */
+const ADOPT_START = "2024-01";
+const ADOPT_COLORS = ["#8a4a30","#a85a30","#c56b2c","#e37a24","#ff8a3d"];
+const ADOPT_LABELS = ["1 product","2 products","3 products","4 products","5+ products"];
+const ADOPT_SHORT  = ["1","2","3","4","5+"];
+
 /* ---------------- SQL generators ---------------- */
 const DEALS="STAGING.HUBSPOT.STG_DEALS", REPORT="KITCHEN.PANTRY.INGR_MONTHLY_REPORT_V2", START="2023-01-01";
 /* Closed-won bookings come only from the New Business (default) and XSell pipelines. */
@@ -203,6 +212,19 @@ SELECT a.name, a.rep, COALESCE(mn.name, a.mid, '—') AS merchant, a.type, ROUND
 FROM alloc a LEFT JOIN rev r ON r.mid=a.mid AND r.type=a.type LEFT JOIN mnames mn ON mn.mid=a.mid
 ORDER BY a.arr DESC NULLS LAST LIMIT 500`; };
 
+/* Product adoption: for each calendar month (from ADOPT_START) and each merchant,
+   count how many of the mapped products carry positive revenue that month, cap the
+   count at 5 (5+), then aggregate per month + bucket into a merchant count and the
+   revenue those merchants contributed. `types` are the mapped types (slug,cols).
+   Runtime rejects SQL comments, so none appear inside the literal. */
+const qProductAdoption = (types) => `WITH
+${revLongCTE(types)},
+prod AS (SELECT mid, m, COUNT(DISTINCT type) AS nprod, SUM(rev) AS rev FROM rev WHERE rev > 0 GROUP BY 1,2)
+SELECT TO_CHAR(m,'YYYY-MM') AS month, LEAST(nprod,5) AS bucket,
+  COUNT(DISTINCT mid) AS merchants, ROUND(SUM(rev)) AS revenue
+FROM prod WHERE nprod >= 1 AND m >= DATE '${ADOPT_START}-01'
+GROUP BY 1,2 ORDER BY 1,2`;
+
 /* ---------------- data helpers ---------------- */
 function toObj(row, cols){
   if(Array.isArray(row)){ const o={}; cols.forEach((c,i)=>o[c]=row[i]); return o; }
@@ -251,13 +273,15 @@ async function refreshAll(config, nowKey){
   const mt = mappedTypes(config);
   if(!mt.length) throw new Error("No deal types are mapped to a revenue column. Open Configure to map at least one.");
   const span = monthSpan(nowKey);
-  const [grid, totalMapped] = await Promise.all([
+  const [grid, totalMapped, adoption] = await Promise.all([
     runSql(qGrid(mt,span), ["cohort","type","exp_arr","act_arr","cnt_arr"]),
     runSql(qTotalMapped(mt,span), ["type","rev_arr","mon_arr"]),
+    runSql(qProductAdoption(mt), ["month","bucket","merchants","revenue"]),
   ]);
   return {
     grid: grid.map(r=>({cohort:r.cohort, type:r.type, exp:parseArr(r.exp_arr), act:parseArr(r.act_arr), cnt:parseArr(r.cnt_arr)})),
     totalMapped: totalMapped.map(r=>({type:r.type, rev:parseArr(r.rev_arr), months:parseStrArr(r.mon_arr)})),
+    productAdoption: adoption.map(r=>({month:r.month, bucket:num(r.bucket), merchants:num(r.merchants), revenue:num(r.revenue)})),
     nowKey, refreshedAt: new Date().toISOString(),
   };
 }
@@ -272,17 +296,17 @@ async function saveData(x){
   const chunks = [];
   for(let i=0;i<x.grid.length;i+=CHUNK) chunks.push(x.grid.slice(i,i+CHUNK));
   for(let i=0;i<chunks.length;i++) await col.create({value:chunks[i]}, "grid_"+i);
-  await col.create({value:{ v:3, chunks:chunks.length, totalMapped:x.totalMapped,
-    nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
+  await col.create({value:{ v:4, chunks:chunks.length, totalMapped:x.totalMapped,
+    productAdoption:x.productAdoption||[], nowKey:x.nowKey, refreshedAt:x.refreshedAt }}, "latest");
 }
 async function loadData(){
   try{
     const docs = await fridge.db.collection(STORE.data).list();
     const map = {}; for(const d of docs) map[d.key] = (d.value && d.value.value!==undefined) ? d.value.value : d.value;
-    const man = map["latest"]; if(!man || man.v!==3) return null;
+    const man = map["latest"]; if(!man || !(man.v>=3)) return null;
     const grid=[]; for(let i=0;i<man.chunks;i++){ const c=map["grid_"+i]; if(Array.isArray(c)) grid.push(...c); }
     if(grid.length!==0 || man.chunks===0)
-      return { grid, totalMapped:man.totalMapped, nowKey:man.nowKey, refreshedAt:man.refreshedAt };
+      return { grid, totalMapped:man.totalMapped, productAdoption:man.productAdoption||[], nowKey:man.nowKey, refreshedAt:man.refreshedAt };
     return null;
   }catch{ return null; }
 }
@@ -358,6 +382,8 @@ const IC = {
   check: `<polyline points="20 6 9 17 4 12"/>`,
   loader: `<line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/>`,
   wand: `<path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/>`,
+  layers: `<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>`,
+  bars: `<line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>`,
 };
 const btnStyle = active => ({ display:"inline-flex", alignItems:"center", gap:"8px", padding:"8px 16px",
   fontSize:"12px", fontWeight:600, letterSpacing:"0.01em", cursor:"pointer",
@@ -371,6 +397,7 @@ const state = {
   config:null, discovered:null, data:null,
   selected:new Set(), view:"msc", metric:"pct",
   typesOpen:false, modal:null, drawer:false,
+  tab:"attainment", adoptMetric:"count", adoptMode:"abs",
 };
 const defaultSelection = (cfg, data) => { const gt=gridTypes(data); return new Set(gt.length ? gt : cfg.order.filter(s=>cfg.types[s].cols && cfg.types[s].cols.length)); };
 function setState(patch){ Object.assign(state, patch); render(); }
@@ -420,8 +447,11 @@ async function saveConfigAndRefresh(newCfg){
 function render(){
   const app = document.getElementById("app");
   app.innerHTML="";
-  app.appendChild(Header());
-  const main = h("main",{style:{maxWidth:"1440px",margin:"0 auto",padding:"24px 48px 64px"}});
+  const shell = h("div",{style:{display:"flex",alignItems:"stretch",minHeight:"100vh"}});
+  shell.appendChild(Sidebar());
+  const col = h("div",{style:{flex:"1 1 auto",minWidth:0,display:"flex",flexDirection:"column"}});
+  col.appendChild(Header());
+  const main = h("main",{style:{maxWidth:"1440px",width:"100%",margin:"0 auto",padding:"24px 48px 64px"}});
   if(state.error) main.appendChild(ErrorBanner(state.error));
 
   if(state.phase==="init") main.appendChild(Splash("Connecting to Fridge runtime…"));
@@ -434,44 +464,73 @@ function render(){
     state.types = gridTypes(state.data).sort((a,b)=>{
       const ca=cloudOrder[typeCloud(state.config,a)]??9, cb=cloudOrder[typeCloud(state.config,b)]??9;
       return ca-cb || typeName(state.config,a).localeCompare(typeName(state.config,b)); });
-    const model = computeModel(state.data, state.selected, state.config);
-    state._model = model;
     if(state.phase==="busy") main.appendChild(h("div",{style:{fontSize:"12px",color:T.orange,marginBottom:"16px",display:"flex",gap:"8px",alignItems:"center"}}, spinIcon(), state.busyMsg));
-    main.appendChild(ScopeBar(model));
-    main.appendChild(StatStrip(model));
-    main.appendChild(h("div",{style:{marginTop:"24px"}}, CohortTable(model)));
-    main.appendChild(FooterNote());
+    if(state.tab==="adoption"){
+      AdoptionView(main);
+    } else {
+      const model = computeModel(state.data, state.selected, state.config);
+      state._model = model;
+      main.appendChild(ScopeBar(model));
+      main.appendChild(StatStrip(model));
+      main.appendChild(h("div",{style:{marginTop:"24px"}}, CohortTable(model)));
+      main.appendChild(FooterNote());
+    }
   }
-  app.appendChild(main);
+  col.appendChild(main);
+  shell.appendChild(col);
+  app.appendChild(shell);
   renderOverlay();
 }
 function spinIcon(){ const s=icon(IC.loader,13); s.className="spin"; return s; }
 
+function Sidebar(){
+  const navItem=(id,label,ic,sub)=>{
+    const active=state.tab===id;
+    return h("button",{style:{display:"flex",alignItems:"flex-start",gap:"10px",width:"100%",textAlign:"left",padding:"10px 14px",cursor:"pointer",border:"none",borderLeft:`2px solid ${active?T.orange:"transparent"}`,background:active?"rgba(255,255,255,0.05)":"transparent",color:active?T.text:T.muted},
+      onClick:()=>setState({tab:id})},
+      h("span",{style:{marginTop:"1px",flex:"0 0 auto"}}, icon(ic,15)),
+      h("span",null,
+        h("div",{style:{fontSize:"13px",fontWeight:600}},label),
+        sub?h("div",{style:{fontSize:"10px",color:T.muted,marginTop:"2px",fontWeight:400}},sub):null));
+  };
+  return h("aside",{style:{width:"236px",flex:"0 0 236px",borderRight:`1px solid ${T.divider}`,background:T.surfaceAlt,display:"flex",flexDirection:"column",position:"sticky",top:0,height:"100vh",overflowY:"auto"}},
+    h("div",{style:{padding:"24px 16px 20px"}},
+      h("img",{src:LOGO,alt:"Redo",style:{height:"24px",display:"block"}}),
+      h("div",{style:{marginTop:"14px"}},
+        h("span",{style:{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:T.muted,border:`1px solid ${T.divider2}`,padding:"3px 8px"}},"Live · Fridge"))),
+    h("div",{style:{fontSize:"10px",fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:T.muted,padding:"4px 16px 8px"}},"Dashboards"),
+    navItem("attainment","Deal Attainment",IC.grid,"Cohort revenue attainment"),
+    navItem("adoption","Product Adoption",IC.layers,"Products per merchant"),
+    h("div",{style:{marginTop:"auto",padding:"16px",borderTop:`1px solid ${T.divider}`,fontSize:"11px",color:T.muted,wordBreak:"break-all"}}, user?.email||""));
+}
+
 function Header(){
   const refreshedLabel = state.data?.refreshedAt ? new Date(state.data.refreshedAt).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"}) : "";
-  const topRow = h("div",{style:{display:"flex",alignItems:"center",gap:"12px"}},
-    h("img",{src:LOGO,alt:"Redo",style:{height:"28px",display:"block"}}),
-    h("span",{style:{fontSize:"10px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",color:T.muted,border:`1px solid ${T.divider2}`,padding:"3px 8px"}},"Live · Fridge"),
-    h("span",{style:{marginLeft:"auto"}}),
-    user?.email ? h("span",{style:{fontSize:"11px",color:T.muted}}, user.email) : null,
-  );
-  const viewToggle = Toggle(state.view, v=>setState({view:v}), [
-    {v:"msc",label:"Months since close",ic:IC.grid},{v:"cal",label:"Calendar",ic:IC.cal}]);
-  const metricToggle = Toggle(state.metric, v=>setState({metric:v}), [{v:"pct",label:"%"},{v:"usd",label:"$"}]);
-  const cfgBtn = h("button",{style:btnStyle(false), disabled: !state.config, onClick:()=>setState({drawer:true})}, icon(IC.settings,13), "Configure");
   const refreshBtn = h("button",{style:{...btnStyle(false),border:`1px solid ${T.orange}`,color:T.orange}, disabled: state.phase==="busy"||!fridge, onClick:()=>doRefresh()},
     (()=>{ const i=icon(IC.refresh,13); if(state.phase==="busy")i.className="spin"; return i; })(), "Refresh");
-  const controls = h("div",{style:{display:"flex",gap:"8px",paddingBottom:"4px",flexWrap:"wrap"}}, viewToggle, metricToggle, cfgBtn, refreshBtn);
+  let title, subtitle, controls;
+  if(state.tab==="adoption"){
+    title="Product adoption";
+    subtitle=`Merchants by number of Redo products with revenue${refreshedLabel?` · refreshed ${refreshedLabel}`:""} · monthly since Jan ’24`;
+    const metricToggle = Toggle(state.adoptMetric, v=>setState({adoptMetric:v}), [{v:"count",label:"Merchants",ic:IC.layers},{v:"revenue",label:"Revenue"}]);
+    const modeToggle = Toggle(state.adoptMode, v=>setState({adoptMode:v}), [{v:"abs",label:"Absolute",ic:IC.bars},{v:"pct",label:"100%"}]);
+    controls = h("div",{style:{display:"flex",gap:"8px",paddingBottom:"4px",flexWrap:"wrap"}}, metricToggle, modeToggle, refreshBtn);
+  } else {
+    title="Deal attainment";
+    subtitle=`Live from Snowflake via Redo Unified${refreshedLabel?` · refreshed ${refreshedLabel}`:""} · New Business + XSell · cohorts from Jan ’23 (MST) · current month is MTD`;
+    const viewToggle = Toggle(state.view, v=>setState({view:v}), [
+      {v:"msc",label:"Months since close",ic:IC.grid},{v:"cal",label:"Calendar",ic:IC.cal}]);
+    const metricToggle = Toggle(state.metric, v=>setState({metric:v}), [{v:"pct",label:"%"},{v:"usd",label:"$"}]);
+    const cfgBtn = h("button",{style:btnStyle(false), disabled: !state.config, onClick:()=>setState({drawer:true})}, icon(IC.settings,13), "Configure");
+    controls = h("div",{style:{display:"flex",gap:"8px",paddingBottom:"4px",flexWrap:"wrap"}}, viewToggle, metricToggle, cfgBtn, refreshBtn);
+  }
   const titleWrap = h("div",{style:{marginRight:"auto"}},
-    h("h1",{style:{margin:0,fontFamily:SERIF,fontWeight:400,fontSize:"48px",lineHeight:"56px",letterSpacing:"-0.02em"}},"Deal attainment"),
+    h("h1",{style:{margin:0,fontFamily:SERIF,fontWeight:400,fontSize:"48px",lineHeight:"56px",letterSpacing:"-0.02em"}},title),
     h("div",{style:{fontSize:"12px",color:T.muted,marginTop:"4px",display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}},
-      icon(IC.db,12), `Live from Snowflake via Redo Unified${refreshedLabel?` · refreshed ${refreshedLabel}`:""} · New Business + XSell · cohorts from Jan ’23 (MST) · current month is MTD`),
-  );
+      icon(IC.db,12), subtitle));
   return h("header",{style:{borderBottom:`1px solid ${T.divider}`}},
-    h("div",{style:{maxWidth:"1440px",margin:"0 auto",padding:"24px 48px 0"}},
-      topRow,
-      h("div",{style:{display:"flex",alignItems:"flex-end",gap:"24px",flexWrap:"wrap",padding:"24px 0"}}, titleWrap, controls),
-    ));
+    h("div",{style:{maxWidth:"1440px",margin:"0 auto",padding:"28px 48px"}},
+      h("div",{style:{display:"flex",alignItems:"flex-end",gap:"24px",flexWrap:"wrap"}}, titleWrap, controls)));
 }
 function Toggle(value, onChange, options){
   return h("div",{style:{display:"inline-flex",border:`1px solid ${T.divider2}`}},
@@ -565,6 +624,132 @@ function FooterNote(){
   return h("div",{style:{marginTop:"24px",display:"flex",gap:"32px",flexWrap:"wrap",alignItems:"flex-start"}}, legend,
     h("p",{style:{fontSize:"12px",color:T.muted,maxWidth:"640px",margin:0,lineHeight:"20px"}},
       "Closed ARR is every NB+XSell closed-won deal in the cohort — matched or not, revenue or not. Attainment = attributed revenue ÷ (ARR ÷ 12); unmatched Redo IDs and zero-revenue deals attain $0 and drag the cohort down. Revenue credits the most recent deal closed on or before each month, so re-signs never double count. The Orphaned revenue row is the only revenue with no deal. Click any cell for the deal list."));
+}
+
+/* ---------------- Product Adoption tab ---------------- */
+function svgEl(tag, attrs, ...kids){
+  const el=document.createElementNS("http://www.w3.org/2000/svg",tag);
+  if(attrs) for(const k in attrs){ const v=attrs[k]; if(v==null||v===false)continue; el.setAttribute(k,v); }
+  for(const kid of kids.flat()){ if(kid==null||kid===false)continue; el.appendChild(typeof kid==="object"?kid:document.createTextNode(String(kid))); }
+  return el;
+}
+function niceMax(v){ if(v<=0)return 1; const p=Math.pow(10,Math.floor(Math.log10(v))); const n=v/p; const s=n<=1?1:n<=2?2:n<=2.5?2.5:n<=5?5:10; return s*p; }
+/* Rectangle path with only the top two corners rounded (the stack's data-end). */
+function topRoundPath(x,y,w,h,r){ r=Math.max(0,Math.min(r,w/2,h)); return `M${x},${y+h} L${x},${y+r} Q${x},${y} ${x+r},${y} L${x+w-r},${y} Q${x+w},${y} ${x+w},${y+r} L${x+w},${y+h} Z`; }
+
+/* Pivot productAdoption rows into per-month arrays of 5 buckets, for both metrics. */
+function adoptData(){
+  const rows=state.data.productAdoption||[];
+  const months=[...new Set(rows.map(r=>r.month))].sort();
+  const cnt={}, rev={}; months.forEach(m=>{cnt[m]=[0,0,0,0,0];rev[m]=[0,0,0,0,0];});
+  rows.forEach(r=>{ if(!cnt[r.month])return; const b=Math.min(Math.max(r.bucket|0,1),5)-1; cnt[r.month][b]=r.merchants||0; rev[r.month][b]=r.revenue||0; });
+  return { months, cnt, rev };
+}
+
+function AdoptionView(main){
+  const rows=state.data.productAdoption;
+  if(!rows || !rows.length){
+    main.appendChild(h("div",{style:{marginTop:"24px"}},
+      Splash(state.phase==="busy"?"Querying product adoption…":"No product-adoption data cached yet. Click Refresh to pull it from Snowflake.", state.phase==="busy"?"spin":null)));
+    return;
+  }
+  const d=adoptData();
+  main.appendChild(AdoptionStats(d));
+  main.appendChild(AdoptionLegend());
+  main.appendChild(AdoptionChart(d));
+  main.appendChild(AdoptionFooter());
+}
+
+function AdoptionStats(d){
+  const last=d.months[d.months.length-1];
+  const c=d.cnt[last]||[0,0,0,0,0];
+  const total=c.reduce((a,b)=>a+b,0);
+  const on2=c[1]+c[2]+c[3]+c[4], on5=c[4];
+  const avg=total? c.reduce((a,v,i)=>a+v*(i+1),0)/total : 0;
+  const grid=h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))",border:`1px solid ${T.divider}`,background:T.surface,marginTop:"8px"}});
+  grid.appendChild(Stat("Active merchants", total.toLocaleString(), `with revenue · ${keyToLabel(last)}`, true));
+  grid.appendChild(Stat("On 2+ products", fmtPct(total?on2/total:null), `${on2.toLocaleString()} merchants`));
+  grid.appendChild(Stat("On 5+ products", fmtPct(total?on5/total:null), `${on5.toLocaleString()} merchants`));
+  grid.appendChild(Stat("Avg products / merchant", total?avg.toFixed(2):"—", "5+ counted as 5"));
+  return grid;
+}
+
+function AdoptionLegend(){
+  const wrap=h("div",{style:{display:"flex",gap:"18px",flexWrap:"wrap",alignItems:"center",margin:"24px 0 10px"}});
+  wrap.appendChild(h("span",{style:{fontSize:"10px",fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:T.muted}},"Products per merchant"));
+  ADOPT_LABELS.forEach((lab,i)=>wrap.appendChild(h("span",{style:{display:"inline-flex",alignItems:"center",gap:"7px",fontSize:"12px",color:T.body}},
+    h("span",{style:{width:"12px",height:"12px",background:ADOPT_COLORS[i],flex:"0 0 auto",borderRadius:"2px"}}), lab)));
+  return wrap;
+}
+
+function AdoptionChart(d){
+  const months=d.months;
+  const vals=state.adoptMetric==="revenue"?d.rev:d.cnt;
+  const isPct=state.adoptMode==="pct", isRev=state.adoptMetric==="revenue";
+  const totals=months.map(m=>vals[m].reduce((a,b)=>a+b,0));
+  const yMax=isPct?1:niceMax(Math.max(1,...totals));
+
+  const padL=64, padR=20, padT=12, padB=52;
+  const H=420, plotH=H-padT-padB, baseY=padT+plotH;
+  const band=Math.max(38, Math.min(76, 1120/months.length));
+  const plotW=Math.round(band*months.length);
+  const W=padL+plotW+padR;
+  const barW=Math.min(28, band-16), gap=2;
+
+  const svg=svgEl("svg",{width:W,height:H,viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":"Merchant product adoption by month",style:"display:block"});
+
+  [0,.25,.5,.75,1].forEach(f=>{
+    const y=baseY - f*plotH;
+    svg.appendChild(svgEl("line",{x1:padL,y1:y,x2:W-padR,y2:y,stroke:T.divider,"stroke-width":1}));
+    const label=isPct?`${Math.round(f*100)}%`:(isRev?fmtMoney(f*yMax):Math.round(f*yMax).toLocaleString());
+    svg.appendChild(svgEl("text",{x:padL-10,y:y+3,"text-anchor":"end","font-size":10,fill:T.muted,"font-family":SANS},label));
+  });
+
+  const tip=h("div",{style:{position:"absolute",pointerEvents:"none",opacity:0,transition:"opacity .08s",background:"#000",border:`1px solid ${T.divider2}`,padding:"8px 10px",fontSize:"11px",color:T.body,zIndex:5,whiteSpace:"nowrap",transform:"translate(-50%,-100%)"}});
+  const showTip=(m,b,val,total)=>{ tip.innerHTML="";
+    tip.appendChild(h("div",{style:{fontWeight:600,color:T.text,marginBottom:"3px",display:"flex",alignItems:"center",gap:"6px"}},
+      h("span",{style:{width:"9px",height:"9px",background:ADOPT_COLORS[b],borderRadius:"2px",display:"inline-block"}}), `${keyToLabel(m)} · ${ADOPT_LABELS[b]}`));
+    tip.appendChild(h("div",null, isRev?`${fmtMoney(val)} revenue`:`${Math.round(val).toLocaleString()} merchants`));
+    tip.appendChild(h("div",{style:{color:T.muted}}, `${fmtPct(total>0?val/total:null)} of month`));
+    tip.style.opacity=1;
+  };
+
+  months.forEach((m,i)=>{
+    const x0=padL + i*band + (band-barW)/2, total=totals[i];
+    let topIdx=-1; for(let b=4;b>=0;b--){ if(vals[m][b]>0){topIdx=b;break;} }
+    let cursor=baseY;
+    for(let b=0;b<5;b++){
+      const val=vals[m][b]; if(val<=0)continue;
+      const frac=isPct?(total>0?val/total:0):(val/yMax);
+      const segH=frac*plotH; if(segH<=0)continue;
+      const drawH=Math.max(0.5, segH-gap), top=cursor-segH;
+      const mark = b===topIdx
+        ? svgEl("path",{d:topRoundPath(x0,top,barW,drawH,4),fill:ADOPT_COLORS[b]})
+        : svgEl("rect",{x:x0,y:top,width:barW,height:drawH,fill:ADOPT_COLORS[b]});
+      mark.addEventListener("mouseenter",()=>showTip(m,b,val,total));
+      mark.addEventListener("mousemove",ev=>{ const r=tip.parentNode.getBoundingClientRect(); tip.style.left=(ev.clientX-r.left)+"px"; tip.style.top=(ev.clientY-r.top-10)+"px"; });
+      mark.addEventListener("mouseleave",()=>{ tip.style.opacity=0; });
+      svg.appendChild(mark);
+      cursor=top;
+    }
+    const cx=padL + i*band + band/2, [yy,mm]=m.split("-").map(Number);
+    svg.appendChild(svgEl("text",{x:cx,y:baseY+16,"text-anchor":"middle","font-size":10,fill:T.muted,"font-family":SANS},MONTH_NAMES[mm-1]));
+    if(mm===1 || i===0) svg.appendChild(svgEl("text",{x:cx,y:baseY+32,"text-anchor":"middle","font-size":10,"font-weight":700,fill:T.body,"font-family":SANS},`’${String(yy).slice(2)}`));
+  });
+
+  svg.appendChild(svgEl("line",{x1:padL,y1:baseY,x2:W-padR,y2:baseY,stroke:T.divider2,"stroke-width":1}));
+
+  const scroller=h("div",{style:{overflowX:"auto",overflowY:"hidden"}}, svg);
+  return h("div",{style:{position:"relative",background:T.surface,border:`1px solid ${T.divider}`,padding:"16px 8px 8px"}}, scroller, tip);
+}
+
+function AdoptionFooter(){
+  return h("div",{style:{marginTop:"24px",display:"flex",gap:"32px",flexWrap:"wrap",alignItems:"flex-start"}},
+    h("p",{style:{fontSize:"12px",color:T.muted,maxWidth:"760px",margin:0,lineHeight:"20px"}},
+      state.adoptMode==="pct"
+        ? "Each bar fills the full height; segments show the share of merchants (Revenue mode: the share of their revenue) on 1, 2, 3, 4, or 5+ Redo products that month. "
+        : "Each bar is a calendar month; segment heights are the number of merchants (Revenue mode: their revenue) on 1, 2, 3, 4, or 5+ Redo products. ",
+      "A merchant is “on” a product in a month when that product has positive revenue in the Monthly Report. Products are the mapped deal-type revenue columns — edit them in the Deal Attainment tab’s Configure drawer. Revenue mode sums each merchant’s revenue across the products they’re on. The latest month may still be in progress."));
 }
 
 function CohortTable(model){

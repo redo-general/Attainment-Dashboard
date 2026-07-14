@@ -1,7 +1,14 @@
 # Deal Attainment Dashboard
 
-A live cohort-attainment dashboard for Redo's usage-based deals, hosted in the
-**Fridge** at **https://deal-attainment.fridge.redo.builders**.
+A live analytics dashboard for Redo's usage-based deals, hosted in the
+**Fridge** at **https://deal-attainment.fridge.redo.builders**. A left-hand menu
+switches between two dashboards:
+
+- **Deal Attainment** — the cohort-attainment grid (below).
+- **Product Adoption** — merchant product breadth over time (see *Product
+  adoption* below).
+
+## Deal Attainment
 
 It answers: for the deals a rep closed in a given month (a *cohort*), what
 percentage of the expected monthly revenue (deal ARR ÷ 12) are we actually
@@ -57,13 +64,39 @@ drawer (a type can sum multiple columns), and persists in `fridge.db`. The last
 refresh is cached in `fridge.db` too, so the dashboard loads instantly and
 re-queries only on **Refresh** or a config change.
 
+## Product adoption
+
+A stacked bar chart of **how many Redo products each merchant is on**, one bar
+per calendar month since **Jan 2024**. A merchant is counted as *on* a product
+in a month when that product has **positive revenue** in
+`INGR_MONTHLY_REPORT_V2` — "products" are the same mapped deal-type revenue
+columns configured on the Deal Attainment tab, so the two dashboards stay in
+sync. Each merchant's product count is bucketed into **1, 2, 3, 4, 5+**.
+
+Two toggles:
+
+- **Merchants ↔ Revenue** — measure each month by the *number of merchants* in
+  each bucket, or by the *revenue* those merchants contributed (each merchant's
+  revenue summed across the products they're on).
+- **Absolute ↔ 100%** — read raw magnitudes, or normalize every bar to 100% to
+  compare the *mix* month over month.
+
+The buckets use a single-hue **ordinal ramp** (dim → bright orange with product
+count), validated colorblind-safe on the dark surface. The query
+(`qProductAdoption`) counts distinct positive-revenue products per merchant per
+month, caps at 5+, and aggregates to a merchant count and revenue sum per month
++ bucket; results are cached alongside the cohort grid in `fridge.db`.
+
 ## Files
 
 - **`index.html`** — the deployed app. Self-contained: theme, SQL generators,
-  the client-side attainment model, and a vanilla-JS UI, importing the Fridge
-  SDK from `/api/sdk` at runtime. This is what is served by the Fridge.
-- **`src/`** — the same app as modular React components (reference / alternate
-  implementation). `npm run build` bundles it via esbuild.
+  the client-side attainment model, both dashboards (Deal Attainment + Product
+  Adoption), and a vanilla-JS UI, importing the Fridge SDK from `/api/sdk` at
+  runtime. This is what is served by the Fridge, and the source of truth.
+- **`src/`** — the Deal Attainment view as modular React components (reference /
+  alternate implementation). It predates the left-hand menu and the Product
+  Adoption tab, so it currently lags `index.html`. `npm run build` bundles it
+  via esbuild.
 - **`build.mjs`, `package.json`** — esbuild config for the React variant.
 
 ## Deploying updates
